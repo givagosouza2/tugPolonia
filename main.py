@@ -155,6 +155,12 @@ def detect_start_10_5(t: np.ndarray, states: np.ndarray, baseline_state: int, ba
 def detect_end_from_marker_10_5(t: np.ndarray, states: np.ndarray, fs: float,
                                end_time: float, end_baseline_sec: float = 1.0,
                                baseline_run: int = 10, other_run: int = 5):
+    """
+    Fim ancorado no marcador final (ROI fim).
+    end_baseline_state = modo em [ROI fim - 1s, ROI fim]
+    Varre para trás procurando: 5 não-baseline seguidos de 10 baseline(end_baseline_state).
+    Retorna (end_baseline_state, t_end) onde t_end = início do bloco final de baseline.
+    """
     end_baseline_state, end_idx = baseline_from_end_marker(t, states, fs, end_time, baseline_sec=end_baseline_sec)
     if end_baseline_state is None or end_idx is None:
         return None, None
@@ -171,6 +177,10 @@ def detect_end_from_marker_10_5(t: np.ndarray, states: np.ndarray, fs: float,
     return end_baseline_state, None
 
 def kmeans_states_1d(x_common: np.ndarray, fs: float, n_states: int, seed: int):
+    """
+    KMeans em uma série 1D no ROI.
+    Features: [x(t), dx/dt]
+    """
     if KMeans is None or StandardScaler is None:
         raise RuntimeError("sklearn não disponível.")
     x = np.asarray(x_common, dtype=float)
@@ -358,6 +368,7 @@ if kin_ready and gyro_ready:
     states_z = kmeans_states_1d(z_common, FS_TARGET, n_states=6, seed=int(seed))
     states_g = kmeans_states_1d(g_common, FS_TARGET, n_states=6, seed=int(seed))
 
+    # Início: baseline do 1º segundo do ROI
     base_y_start = baseline_from_start(states_y, FS_TARGET, baseline_sec=1.0)
     base_z_start = baseline_from_start(states_z, FS_TARGET, baseline_sec=1.0)
     base_g_start = baseline_from_start(states_g, FS_TARGET, baseline_sec=1.0)
@@ -366,6 +377,7 @@ if kin_ready and gyro_ready:
     z_start = detect_start_10_5(t_common, states_z, base_z_start, baseline_run=10, other_run=5)
     g_start = detect_start_10_5(t_common, states_g, base_g_start, baseline_run=10, other_run=5)
 
+    # Fim: ancorado em ROI fim
     base_y_end, y_end = detect_end_from_marker_10_5(t_common, states_y, FS_TARGET, end_time=roi_end,
                                                     end_baseline_sec=1.0, baseline_run=10, other_run=5)
     base_z_end, z_end = detect_end_from_marker_10_5(t_common, states_z, FS_TARGET, end_time=roi_end,
@@ -374,7 +386,7 @@ if kin_ready and gyro_ready:
                                                     end_baseline_sec=1.0, baseline_run=10, other_run=5)
 
     # -------------------------
-    # TABELA (voltou aqui!)
+    # TABELA: Markov início/fim por série
     # -------------------------
     results_df = pd.DataFrame([
         {
@@ -401,17 +413,59 @@ if kin_ready and gyro_ready:
     st.dataframe(results_df, use_container_width=True)
 
     # -------------------------
+    # MÍNIMO da cinemática Y entre início/fim Markov
+    # -------------------------
+    st.divider()
+    st.subheader("Cinemática Y (AP): mínimo entre início e fim (Markov)")
+
+    y_min = None
+    t_min = None
+
+    if y_start is None or y_end is None:
+        st.warning("Não foi possível calcular o mínimo: início/fim Markov da Cinemática Y não foram detectados.")
+    else:
+        t0, t1 = (y_start, y_end) if y_start <= y_end else (y_end, y_start)
+        t_seg, y_seg, _ = segment_by_time(t_kin_sync, y_kin, t0, t1)
+
+        if len(y_seg) < 3:
+            st.warning("Segmento muito curto para estimar mínimo com confiabilidade.")
+        else:
+            idx_min = int(np.nanargmin(y_seg))
+            y_min = float(y_seg[idx_min])
+            t_min = float(t_seg[idx_min])
+
+            st.write(
+                {
+                    "inicio_markov_Y_s": float(t0),
+                    "fim_markov_Y_s": float(t1),
+                    "t_min_Y_s": t_min,
+                    "min_Y": y_min,
+                }
+            )
+
+    # -------------------------
     # PLOTS com linhas vermelhas (Markov)
     # -------------------------
     r1, r2, r3 = st.columns(3)
     with r1:
-        plot_with_lines(
-            t_kin_sync, y_kin, "Cinemática Y (AP)",
-            vlines_black=[roi_start, roi_end], labels_black=["ROI início", "ROI fim"],
-            vlines_red=[v for v in [y_start, y_end] if v is not None],
-            labels_red=[lab for lab, v in zip(["Y início (Markov)", "Y fim (Markov)"], [y_start, y_end]) if v is not None],
-            xlabel="Tempo sincronizado (s)"
-        )
+        v_red = [v for v in [y_start, y_end] if v is not None]
+        l_red = [lab for lab, v in zip(["Y início (Markov)", "Y fim (Markov)"], [y_start, y_end]) if v is not None]
+        # marca também o mínimo com linha sólida (não vermelha) e ponto
+        fig = plt.figure()
+        plt.plot(t_kin_sync, y_kin)
+        plt.axvline(roi_start, linestyle="--", label="ROI início")
+        plt.axvline(roi_end, linestyle="--", label="ROI fim")
+        for i, vl in enumerate(v_red):
+            plt.axvline(vl, linestyle="--", color="red", label=l_red[i])
+        if t_min is not None and y_min is not None:
+            plt.axvline(t_min, linestyle="-", label="t do mínimo")
+            plt.scatter([t_min], [y_min], s=40, label="mínimo")
+        plt.title("Cinemática Y (AP)")
+        plt.xlabel("Tempo sincronizado (s)")
+        plt.legend(loc="upper left", fontsize=8)
+        plt.tight_layout()
+        st.pyplot(fig, clear_figure=True)
+
     with r2:
         plot_with_lines(
             t_kin_sync, z_kin, "Cinemática Z (vertical)",
