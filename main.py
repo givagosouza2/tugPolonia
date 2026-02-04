@@ -89,13 +89,13 @@ def plot_with_lines(
     fig = plt.figure()
     plt.plot(t, x)
 
-    # linhas "normais" (pretas)
+    # linhas pretas (ROI etc.)
     if vlines_black is not None:
         for i, vl in enumerate(vlines_black):
             lab = labels_black[i] if labels_black and i < len(labels_black) else None
             plt.axvline(vl, linestyle="--", label=lab)
 
-    # linhas Markov (vermelhas)
+    # linhas vermelhas (Markov)
     if vlines_red is not None:
         for i, vl in enumerate(vlines_red):
             lab = labels_red[i] if labels_red and i < len(labels_red) else None
@@ -306,20 +306,6 @@ if kin_ready and gyro_ready:
     t_g_sync   = t_g   - float(t_peak_gyro)
     st.info("Tempo sincronizado: t_sync = t − t_pico. Pico ocorre em t=0 em ambos.")
 
-    st.divider()
-    st.subheader("Sinais completos (tempo sincronizado)")
-
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        plot_with_lines(t_kin_sync, y_kin, "Cinemática — Y (AP)",
-                        vlines_black=[0.0], labels_black=["pico (t=0)"], xlabel="Tempo sincronizado (s)")
-    with p2:
-        plot_with_lines(t_kin_sync, z_kin, "Cinemática — Z (vertical)",
-                        vlines_black=[0.0], labels_black=["pico (t=0)"], xlabel="Tempo sincronizado (s)")
-    with p3:
-        plot_with_lines(t_g_sync, g_norm, "Giroscópio — norma (||gyro||)",
-                        vlines_black=[0.0], labels_black=["pico (t=0)"], xlabel="Tempo sincronizado (s)")
-
     # ROI manual
     st.divider()
     st.subheader("Intervalo de interesse (ROI)")
@@ -346,9 +332,8 @@ if kin_ready and gyro_ready:
     if roi_start > roi_end:
         roi_start, roi_end = roi_end, roi_start
 
-    # KMeans/Markov no ROI
     st.divider()
-    st.subheader("K-means/Markov por série no ROI — linhas vermelhas para início/fim detectados")
+    st.subheader("K-means/Markov por série no ROI — linhas vermelhas = início/fim Markov")
 
     if KMeans is None or StandardScaler is None:
         st.error("Para esta etapa é necessário scikit-learn (sklearn).")
@@ -388,13 +373,36 @@ if kin_ready and gyro_ready:
     base_g_end, g_end = detect_end_from_marker_10_5(t_common, states_g, FS_TARGET, end_time=roi_end,
                                                     end_baseline_sec=1.0, baseline_run=10, other_run=5)
 
-    st.write({
-        "Y_inicio": y_start, "Y_fim": y_end,
-        "Z_inicio": z_start, "Z_fim": z_end,
-        "G_inicio": g_start, "G_fim": g_end,
-    })
+    # -------------------------
+    # TABELA (voltou aqui!)
+    # -------------------------
+    results_df = pd.DataFrame([
+        {
+            "Série": "Cinemática Y (AP)",
+            "Início (s)": y_start,
+            "Fim (s)": y_end,
+            "Duração (s)": (y_end - y_start) if (y_start is not None and y_end is not None) else None,
+        },
+        {
+            "Série": "Cinemática Z (vertical)",
+            "Início (s)": z_start,
+            "Fim (s)": z_end,
+            "Duração (s)": (z_end - z_start) if (z_start is not None and z_end is not None) else None,
+        },
+        {
+            "Série": "Norma do giroscópio",
+            "Início (s)": g_start,
+            "Fim (s)": g_end,
+            "Duração (s)": (g_end - g_start) if (g_start is not None and g_end is not None) else None,
+        },
+    ])
 
-    # Plot: ROI linhas pretas, Markov linhas vermelhas
+    st.markdown("### Início e fim detectados (Markov) — por série")
+    st.dataframe(results_df, use_container_width=True)
+
+    # -------------------------
+    # PLOTS com linhas vermelhas (Markov)
+    # -------------------------
     r1, r2, r3 = st.columns(3)
     with r1:
         plot_with_lines(
