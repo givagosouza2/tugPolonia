@@ -5,41 +5,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
 
-st.set_page_config(layout="wide", page_title="Sincronização Cinemática x Giroscópio")
+st.set_page_config(layout="wide", page_title="Sync Cinemática x Giroscópio")
 
-st.title("Sincronização manual por pico de salto (Cinemática x Giroscópio)")
+st.title("Sincronização por salto (Cinemática x Giroscópio)")
+
+FS_TARGET = 100.0
+TRIGGER_VIEW_SEC = 20.0
 
 # -------------------------
-# Utilidades
+# Helpers
 # -------------------------
 def read_table(uploaded_file) -> pd.DataFrame:
-    """Lê CSV/TXT tentando inferir separador. Mantém apenas colunas numéricas quando possível."""
     df = pd.read_csv(uploaded_file, sep=None, engine="python")
     # tenta converter para numérico quando possível
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="ignore")
     return df
 
-def pick_column(df: pd.DataFrame, label: str, preferred: list[str]):
-    cols = list(df.columns)
-    # tenta auto-selecionar por nome
-    lower_map = {c: str(c).lower() for c in cols}
-    for p in preferred:
-        for c in cols:
-            if p in lower_map[c]:
-                return st.selectbox(label, cols, index=cols.index(c))
-    return st.selectbox(label, cols, index=0)
-
-def butter_lowpass_filtfilt(x: np.ndarray, fs: float, cutoff_hz: float, order: int = 4) -> np.ndarray:
-    nyq = 0.5 * fs
-    wn = cutoff_hz / nyq
-    b, a = signal.butter(order, wn, btype="lowpass")
-    return signal.filtfilt(b, a, x)
-
 def safe_numeric(series) -> np.ndarray:
     x = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
-    mask = np.isfinite(x)
-    if mask.sum() < 5:
+    if np.isfinite(x).sum() < 5:
         raise ValueError("A coluna selecionada não parece numérica (muitos NaN/inf).")
     return x
 
@@ -47,100 +32,120 @@ def time_vector(n: int, fs: float) -> np.ndarray:
     return np.arange(n, dtype=float) / float(fs)
 
 def interpolate_to_fs(t_in: np.ndarray, x_in: np.ndarray, fs_out: float):
-    # garante monotonicidade
+    # ordena e remove tempos repetidos
     order = np.argsort(t_in)
     t_in = t_in[order]
     x_in = x_in[order]
 
-    # remove duplicatas de tempo
     dt = np.diff(t_in)
     keep = np.hstack(([True], dt > 0))
     t_in = t_in[keep]
     x_in = x_in[keep]
 
+    # remove NaNs
+    m = np.isfinite(t_in) & np.isfinite(x_in)
+    t_in = t_in[m]
+    x_in = x_in[m]
+
+    if len(t_in) < 5:
+        raise ValueError("Tempo do giroscópio inválido (poucos pontos válidos).")
+
     t_out = np.arange(t_in[0], t_in[-1], 1.0 / fs_out)
     x_out = np.interp(t_out, t_in, x_in)
     return t_out, x_out
 
-def find_peak_in_window(t: np.ndarray, x: np.ndarray, t0: float, t1: float):
-    m = (t >= t0) & (t <= t1)
-    if m.sum() < 3:
-        return None, None
-    idx_local = np.argmax(x[m])
-    idx = np.where(m)[0][0] + idx_local
-    return idx, t[idx]
+def butter_lowpass_filtfilt(x: np.ndarray, fs: float, cutoff_hz: float, order: int = 4) -> np.ndarray:
+    nyq = 0.5 * fs
+    wn = cutoff_hz / nyq
+    b, a = signal.butter(order, wn, btype="lowpass")
+    return signal.filtfilt(b, a, x)
+
+def guess_time_unit_and_convert_to_seconds(t):
+    """
+    Heurística:
+    - se a mediana do dt for > 1, assume ms e divide por 1000
+    - caso contrário, assume segundos
+    """
+    t = t.astype(float)
+    t_sorted = np.sort(t[np.isfinite(t)])
+    if len(t_sorted) < 5:
+        return t
+    dt_med = np.nanmedian(np.diff(t_sorted))
+    if dt_med > 1.0:
+        return t / 1000.0
+    return t
+
+def plot_simple(x, y, title, xlabel="Tempo (s)", ylabel=""):
+    fig = plt.figure()
+    plt.plot(x, y)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    if ylabel:
+        plt.ylabel(ylabel)
+    plt.tight_layout()
+    st.pyplot(fig, clear_figure=True)
 
 # -------------------------
-# Uploads
+# Uploads (mantém como está)
 # -------------------------
 colA, colB = st.columns(2)
 
 with colA:
-    st.subheader("1) Arquivo de Cinemática")
+    st.subheader("1) Cinemática")
     kin_file = st.file_uploader("Carregue o arquivo de cinemática (.csv/.txt)", type=["csv", "txt"], key="kin")
 
 with colB:
-    st.subheader("2) Arquivo de Giroscópio")
-    gyro_file = st.file_uploader("Carregue o arquivo de giroscópio (.csv/.txt)", type=["csv", "txt"], key="gyro")
+    st.subheader("2) Giroscópio")
+    gyro_file = st.file_uploader("Carregue o arquivo do giroscópio (.csv/.txt)", type=["csv", "txt"], key="gyro")
 
-fs_target = 100.0
+kin_ready = False
+gyro_ready = False
 
 # -------------------------
 # Processa Cinemática
 # -------------------------
-kin_ready = False
 if kin_file is not None:
     try:
         df_kin = read_table(kin_file)
-        st.success(f"Cinemática carregada: {df_kin.shape[0]} linhas × {df_kin.shape[1]} colunas")
+        st.success(f"Cinemática: {df_kin.shape[0]} linhas × {df_kin.shape[1]} colunas")
 
         c1, c2 = st.columns(2)
         with c1:
-            kin_y_col = pick_column(df_kin, "Coluna Y (antero-posterior)", preferred=["y", "ap", "antero", "anterop", "anterior"])
+            kin_y_col = st.selectbox("Coluna Y (antero-posterior) — cinemática", list(df_kin.columns), index=0)
         with c2:
-            kin_z_col = pick_column(df_kin, "Coluna Z (vertical)", preferred=["z", "vert", "vertical"])
+            kin_z_col = st.selectbox("Coluna Z (vertical) — cinemática", list(df_kin.columns), index=min(1, len(df_kin.columns)-1))
 
         y_kin = safe_numeric(df_kin[kin_y_col])
         z_kin = safe_numeric(df_kin[kin_z_col])
-
-        t_kin = time_vector(len(df_kin), fs_target)
+        t_kin = time_vector(len(df_kin), FS_TARGET)
 
         kin_ready = True
-
     except Exception as e:
         st.error(f"Erro ao processar cinemática: {e}")
 
 # -------------------------
-# Processa Giroscópio
+# Processa Giroscópio (tempo = 1ª coluna)
 # -------------------------
-gyro_ready = False
 if gyro_file is not None:
     try:
         df_g = read_table(gyro_file)
-        st.success(f"Giroscópio carregado: {df_g.shape[0]} linhas × {df_g.shape[1]} colunas")
+        st.success(f"Giroscópio: {df_g.shape[0]} linhas × {df_g.shape[1]} colunas")
 
-        st.markdown("**Seleção de colunas do giroscópio**")
-        g1, g2, g3, g4 = st.columns([1, 1, 1, 1])
+        cols_g = list(df_g.columns)
+        if len(cols_g) < 4:
+            raise ValueError("O arquivo do giroscópio deve ter pelo menos 4 colunas: tempo + 3 eixos.")
 
+        time_col = cols_g[0]  # FIXO: primeira coluna é o tempo
+        t_g_in = safe_numeric(df_g[time_col])
+        t_g_in = guess_time_unit_and_convert_to_seconds(t_g_in)
+
+        g1, g2, g3 = st.columns(3)
         with g1:
-            gx_col = pick_column(df_g, "Coluna gyro X", preferred=["gx", "gyro_x", "x"])
+            gx_col = st.selectbox("Coluna gyro X", cols_g[1:], index=0)
         with g2:
-            gy_col = pick_column(df_g, "Coluna gyro Y (vertical p/ salto)", preferred=["gy", "gyro_y", "y"])
+            gy_col = st.selectbox("Coluna gyro Y (vertical p/ salto)", cols_g[1:], index=min(1, len(cols_g[1:])-1))
         with g3:
-            gz_col = pick_column(df_g, "Coluna gyro Z", preferred=["gz", "gyro_z", "z"])
-        with g4:
-            has_time = st.checkbox("O arquivo do giroscópio tem coluna de tempo?", value=False)
-
-        if has_time:
-            tcol = pick_column(df_g, "Coluna de tempo do giroscópio", preferred=["time", "tempo", "t", "timestamp"])
-            t_g_in = safe_numeric(df_g[tcol])
-
-            # heurística simples: se parecer ms, converte para s
-            if np.nanmedian(np.diff(np.sort(t_g_in))) > 1.0:  # provável ms
-                t_g_in = t_g_in / 1000.0
-        else:
-            fs_g_in = st.number_input("Taxa de aquisição original do giroscópio (Hz)", min_value=1.0, value=100.0, step=1.0)
-            t_g_in = time_vector(len(df_g), fs_g_in)
+            gz_col = st.selectbox("Coluna gyro Z", cols_g[1:], index=min(2, len(cols_g[1:])-1))
 
         gx = safe_numeric(df_g[gx_col])
         gy = safe_numeric(df_g[gy_col])
@@ -152,149 +157,85 @@ if gyro_file is not None:
         gz_dt = signal.detrend(gz, type="linear")
 
         # interp para 100 Hz
-        t_g, gx_i = interpolate_to_fs(t_g_in, gx_dt, fs_target)
-        _,   gy_i = interpolate_to_fs(t_g_in, gy_dt, fs_target)
-        _,   gz_i = interpolate_to_fs(t_g_in, gz_dt, fs_target)
+        t_g, gx_i = interpolate_to_fs(t_g_in, gx_dt, FS_TARGET)
+        _,   gy_i = interpolate_to_fs(t_g_in, gy_dt, FS_TARGET)
+        _,   gz_i = interpolate_to_fs(t_g_in, gz_dt, FS_TARGET)
 
-        # filtro passa-baixa 1.5 Hz
+        # passa-baixa 1.5 Hz
         cutoff = 1.5
-        gx_f = butter_lowpass_filtfilt(gx_i, fs_target, cutoff_hz=cutoff, order=4)
-        gy_f = butter_lowpass_filtfilt(gy_i, fs_target, cutoff_hz=cutoff, order=4)
-        gz_f = butter_lowpass_filtfilt(gz_i, fs_target, cutoff_hz=cutoff, order=4)
+        gx_f = butter_lowpass_filtfilt(gx_i, FS_TARGET, cutoff_hz=cutoff, order=4)
+        gy_f = butter_lowpass_filtfilt(gy_i, FS_TARGET, cutoff_hz=cutoff, order=4)
+        gz_f = butter_lowpass_filtfilt(gz_i, FS_TARGET, cutoff_hz=cutoff, order=4)
 
-        # norma
         g_norm = np.sqrt(gx_f**2 + gy_f**2 + gz_f**2)
 
         gyro_ready = True
-
     except Exception as e:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Plots básicos
-# -------------------------
-if kin_ready or gyro_ready:
-    st.divider()
-    st.subheader("Visualização dos sinais")
-
-    pcol1, pcol2 = st.columns(2)
-
-    if kin_ready:
-        with pcol1:
-            st.markdown("**Cinemática (100 Hz) — eixos Y e Z**")
-            fig = plt.figure()
-            plt.plot(t_kin, y_kin, label="Y (AP)")
-            plt.plot(t_kin, z_kin, label="Z (vertical)")
-            plt.xlabel("Tempo (s)")
-            plt.legend()
-            plt.tight_layout()
-            st.pyplot(fig, clear_figure=True)
-
-    if gyro_ready:
-        with pcol2:
-            st.markdown("**Giroscópio — norma (detrend + interp 100 Hz + LP 1,5 Hz)**")
-            fig = plt.figure()
-            plt.plot(t_g, g_norm, label="||gyro||")
-            plt.xlabel("Tempo (s)")
-            plt.legend()
-            plt.tight_layout()
-            st.pyplot(fig, clear_figure=True)
-
-# -------------------------
-# Sincronização manual
+# 1) Trigger view: primeiros 20 segundos (Z kin e Y gyro)
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
-    st.subheader("Sincronização manual pelo pico do salto")
+    st.subheader("Trigger (primeiros 20 segundos)")
 
-    st.markdown(
-        "1) Escolha uma **janela inicial** para inspecionar o começo dos registros.\n"
-        "2) Dentro dessa janela, ajuste o **slider do pico** em cada sinal.\n"
-        "3) O app alinha os tempos usando a diferença entre os picos."
-    )
+    tmax = TRIGGER_VIEW_SEC
 
-    cwin1, cwin2, cwin3 = st.columns([1, 1, 1])
-    with cwin1:
-        win_sec = st.number_input("Janela a partir do início (s)", min_value=1.0, value=5.0, step=0.5)
-    with cwin2:
-        kin_use = st.selectbox("Usar qual eixo da cinemática para detectar salto?", ["Z (vertical)", "Y (AP)"])
-    with cwin3:
-        gyro_use = st.selectbox("Usar qual sinal do giroscópio para detectar salto?", ["Norma ||gyro||", "Eixo Y (filtrado)"])
+    # recortes
+    mk = (t_kin >= 0) & (t_kin <= tmax)
+    mg = (t_g >= 0) & (t_g <= tmax)
 
-    # define sinal de sincronização
-    kin_sync = z_kin if kin_use.startswith("Z") else y_kin
-    gyro_sync = g_norm if gyro_use.startswith("Norma") else gy_f
-
-    # janela (início)
-    t0, t1 = 0.0, float(win_sec)
-
-    # mostra zoom da janela
-    z1, z2 = st.columns(2)
-    with z1:
-        st.markdown("**Zoom — cinemática (janela inicial)**")
+    # lado a lado: Z cinemática e Y giroscópio (filtrado)
+    cL, cR = st.columns(2)
+    with cL:
         fig = plt.figure()
-        m = (t_kin >= t0) & (t_kin <= t1)
-        plt.plot(t_kin[m], kin_sync[m])
+        plt.plot(t_kin[mk], z_kin[mk])
+        plt.title("Cinemática — eixo Z (0–20 s)")
         plt.xlabel("Tempo (s)")
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    with z2:
-        st.markdown("**Zoom — giroscópio (janela inicial)**")
+    with cR:
         fig = plt.figure()
-        m = (t_g >= t0) & (t_g <= t1)
-        plt.plot(t_g[m], gyro_sync[m])
+        plt.plot(t_g[mg], gy_f[mg])
+        plt.title("Giroscópio — eixo Y (filtrado) (0–20 s)")
         plt.xlabel("Tempo (s)")
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    st.markdown("### Escolha manual do pico do salto")
+# -------------------------
+# 2) Três colunas: Y kin, Z kin, norma gyro
+# -------------------------
+if kin_ready and gyro_ready:
+    st.divider()
+    st.subheader("Sinais completos (3 colunas)")
 
-    # sliders para escolher o pico (tempo)
-    s1, s2 = st.columns(2)
-    with s1:
-        peak_t_kin = st.slider("Tempo do pico (cinemática)", min_value=0.0, max_value=float(win_sec), value=min(1.0, float(win_sec)))
-    with s2:
-        peak_t_gyro = st.slider("Tempo do pico (giroscópio)", min_value=0.0, max_value=float(win_sec), value=min(1.0, float(win_sec)))
+    p1, p2, p3 = st.columns(3)
 
-    # pega índice mais próximo
-    idx_kin = int(np.argmin(np.abs(t_kin - peak_t_kin)))
-    idx_gyro = int(np.argmin(np.abs(t_g - peak_t_gyro)))
+    with p1:
+        fig = plt.figure()
+        plt.plot(t_kin, y_kin)
+        plt.title("Cinemática — tempo × eixo Y (AP)")
+        plt.xlabel("Tempo (s)")
+        plt.tight_layout()
+        st.pyplot(fig, clear_figure=True)
 
-    # offset para alinhar: queremos que o pico do gyro caia no pico da cinemática
-    offset = t_g[idx_gyro] - t_kin[idx_kin]
-    t_g_aligned = t_g - offset
+    with p2:
+        fig = plt.figure()
+        plt.plot(t_kin, z_kin)
+        plt.title("Cinemática — tempo × eixo Z (vertical)")
+        plt.xlabel("Tempo (s)")
+        plt.tight_layout()
+        st.pyplot(fig, clear_figure=True)
 
-    st.info(f"Offset aplicado ao giroscópio: {offset:.4f} s (gyro deslocado por -offset).")
+    with p3:
+        fig = plt.figure()
+        plt.plot(t_g, g_norm)
+        plt.title("Giroscópio — tempo × norma (||gyro||)")
+        plt.xlabel("Tempo (s)")
+        plt.tight_layout()
+        st.pyplot(fig, clear_figure=True)
 
-    # gráfico sincronizado
-    st.markdown("### Sinais sincronizados (cinemática vs giroscópio)")
-    fig = plt.figure()
-    plt.plot(t_kin, kin_sync, label=f"Cinemática ({kin_use})")
-    plt.plot(t_g_aligned, gyro_sync, label=f"Giroscópio ({gyro_use})", alpha=0.9)
-    plt.axvline(t_kin[idx_kin], linestyle="--", label="Pico cinemática")
-    plt.axvline(t_g_aligned[idx_gyro], linestyle="--", label="Pico giroscópio (alinhado)")
-    plt.xlabel("Tempo sincronizado (s)")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-    # opcional: recorte sincronizado a partir do pico
-    st.markdown("### Recorte a partir do pico (opcional)")
-    post_sec = st.number_input("Duração após o pico (s)", min_value=1.0, value=10.0, step=1.0)
-    t_start = t_kin[idx_kin]
-    t_end = t_start + float(post_sec)
-
-    fig = plt.figure()
-    mk = (t_kin >= t_start) & (t_kin <= t_end)
-    mg = (t_g_aligned >= t_start) & (t_g_aligned <= t_end)
-    plt.plot(t_kin[mk], kin_sync[mk], label="Cinemática (recorte)")
-    plt.plot(t_g_aligned[mg], gyro_sync[mg], label="Giroscópio (recorte)", alpha=0.9)
-    plt.xlabel("Tempo sincronizado (s)")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-else:
-    st.caption("Carregue os dois arquivos para habilitar a sincronização manual.")
-
+elif kin_file is None or gyro_file is None:
+    st.caption("Carregue os dois arquivos para habilitar a visualização do trigger e os 3 gráficos.")
