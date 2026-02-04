@@ -10,6 +10,7 @@ st.title("Sincronização por salto (Cinemática x Giroscópio)")
 
 FS_TARGET = 100.0
 TRIGGER_VIEW_SEC = 20.0
+CUTOFF_HZ = 1.5
 
 # -------------------------
 # Helpers
@@ -28,6 +29,17 @@ def safe_numeric(series) -> np.ndarray:
 
 def time_vector(n: int, fs: float) -> np.ndarray:
     return np.arange(n, dtype=float) / float(fs)
+
+def guess_time_unit_and_convert_to_seconds(t: np.ndarray) -> np.ndarray:
+    t = t.astype(float)
+    t_sorted = np.sort(t[np.isfinite(t)])
+    if len(t_sorted) < 5:
+        return t
+    dt_med = np.nanmedian(np.diff(t_sorted))
+    # se dt mediano > 1, provavelmente está em ms
+    if dt_med > 1.0:
+        return t / 1000.0
+    return t
 
 def interpolate_to_fs(t_in: np.ndarray, x_in: np.ndarray, fs_out: float):
     order = np.argsort(t_in)
@@ -58,27 +70,12 @@ def butter_lowpass_filtfilt(x: np.ndarray, fs: float, cutoff_hz: float, order: i
     b, a = signal.butter(order, wn, btype="lowpass")
     return signal.filtfilt(b, a, x)
 
-def guess_time_unit_and_convert_to_seconds(t: np.ndarray) -> np.ndarray:
-    t = t.astype(float)
-    t_sorted = np.sort(t[np.isfinite(t)])
-    if len(t_sorted) < 5:
-        return t
-    dt_med = np.nanmedian(np.diff(t_sorted))
-    # se dt mediano > 1, provavelmente ms
-    if dt_med > 1.0:
-        return t / 1000.0
-    return t
-
-def nearest_index(t: np.ndarray, tt: float) -> int:
-    return int(np.argmin(np.abs(t - tt)))
-
-def plot_line(t, x, title, vline=None, vline_label=None):
+def plot_with_vline(t, x, title, vline=None, vlabel="pico"):
     fig = plt.figure()
     plt.plot(t, x)
     if vline is not None:
-        plt.axvline(vline, linestyle="--", label=vline_label if vline_label else "pico")
-        if vline_label:
-            plt.legend()
+        plt.axvline(vline, linestyle="--", label=vlabel)
+        plt.legend()
     plt.title(title)
     plt.xlabel("Tempo (s)")
     plt.tight_layout()
@@ -91,6 +88,7 @@ colA, colB = st.columns(2)
 with colA:
     st.subheader("1) Cinemática")
     kin_file = st.file_uploader("Carregue o arquivo de cinemática (.csv/.txt)", type=["csv", "txt"], key="kin")
+
 with colB:
     st.subheader("2) Giroscópio")
     gyro_file = st.file_uploader("Carregue o arquivo do giroscópio (.csv/.txt)", type=["csv", "txt"], key="gyro")
@@ -99,7 +97,7 @@ kin_ready = False
 gyro_ready = False
 
 # -------------------------
-# Cinemática
+# Processa Cinemática
 # -------------------------
 if kin_file is not None:
     try:
@@ -114,6 +112,8 @@ if kin_file is not None:
 
         y_kin = safe_numeric(df_kin[kin_y_col])
         z_kin = safe_numeric(df_kin[kin_z_col])
+
+        # tempo (100 Hz)
         t_kin = time_vector(len(df_kin), FS_TARGET)
 
         kin_ready = True
@@ -121,7 +121,7 @@ if kin_file is not None:
         st.error(f"Erro ao processar cinemática: {e}")
 
 # -------------------------
-# Giroscópio (tempo = 1ª coluna)
+# Processa Giroscópio (tempo = 1ª coluna)
 # -------------------------
 if gyro_file is not None:
     try:
@@ -132,7 +132,7 @@ if gyro_file is not None:
         if len(cols_g) < 4:
             raise ValueError("O arquivo do giroscópio deve ter pelo menos 4 colunas: tempo + 3 eixos.")
 
-        time_col = cols_g[0]  # FIXO
+        time_col = cols_g[0]  # FIXO: primeira coluna = tempo
         t_g_in = safe_numeric(df_g[time_col])
         t_g_in = guess_time_unit_and_convert_to_seconds(t_g_in)
 
@@ -153,17 +153,17 @@ if gyro_file is not None:
         gy_dt = signal.detrend(gy, type="linear")
         gz_dt = signal.detrend(gz, type="linear")
 
-        # interp p/ 100 Hz
+        # interpolação p/ 100 Hz
         t_g, gx_i = interpolate_to_fs(t_g_in, gx_dt, FS_TARGET)
         _,   gy_i = interpolate_to_fs(t_g_in, gy_dt, FS_TARGET)
         _,   gz_i = interpolate_to_fs(t_g_in, gz_dt, FS_TARGET)
 
         # LP 1.5 Hz
-        cutoff = 1.5
-        gx_f = butter_lowpass_filtfilt(gx_i, FS_TARGET, cutoff_hz=cutoff, order=4)
-        gy_f = butter_lowpass_filtfilt(gy_i, FS_TARGET, cutoff_hz=cutoff, order=4)
-        gz_f = butter_lowpass_filtfilt(gz_i, FS_TARGET, cutoff_hz=cutoff, order=4)
+        gx_f = butter_lowpass_filtfilt(gx_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
+        gy_f = butter_lowpass_filtfilt(gy_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
+        gz_f = butter_lowpass_filtfilt(gz_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
 
+        # norma
         g_norm = np.sqrt(gx_f**2 + gy_f**2 + gz_f**2)
 
         gyro_ready = True
@@ -171,120 +171,109 @@ if gyro_file is not None:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Trigger view + sliders + sincronização
+# Trigger: 0–20 s + inputs numéricos + sincronização por "zerar o tempo"
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
-    st.subheader("Trigger (0–20 s) + ajuste manual do pico")
+    st.subheader("Ajuste do trigger (0–20 s) — escolha do pico e zeragem do tempo")
+
+    # escolha do sinal de trigger em cada instrumento (como você descreveu)
+    sA, sB = st.columns(2)
+    with sA:
+        kin_trigger_axis = st.selectbox("Trigger na cinemática", ["Z (vertical)", "Y (AP)"], index=0)
+    with sB:
+        gyro_trigger_axis = st.selectbox("Trigger no giroscópio", ["Y (filtrado)", "Norma ||gyro||"], index=0)
+
+    kin_trig = z_kin if kin_trigger_axis.startswith("Z") else y_kin
+    gyro_trig = gy_f if gyro_trigger_axis.startswith("Y") else g_norm
 
     # recortes 0–20 s
     tmax = float(TRIGGER_VIEW_SEC)
     mk = (t_kin >= 0) & (t_kin <= tmax)
     mg = (t_g >= 0) & (t_g <= tmax)
 
-    # escolha do eixo cinemática para trigger (mantém padrão Z)
-    trig_col1, trig_col2, trig_col3 = st.columns([1.2, 1.2, 1.6])
-    with trig_col1:
-        kin_trigger_axis = st.selectbox("Trigger na cinemática", ["Z (vertical)", "Y (AP)"], index=0)
-    with trig_col2:
-        gyro_trigger_signal = st.selectbox("Trigger no giroscópio", ["Y (filtrado)", "Norma ||gyro||"], index=0)
-    with trig_col3:
-        window_post = st.number_input("Janela após o pico para visualizar sincronizado (s)", min_value=1.0, value=10.0, step=1.0)
-
-    kin_trig = z_kin if kin_trigger_axis.startswith("Z") else y_kin
-    gyro_trig = gy_f if gyro_trigger_signal.startswith("Y") else g_norm
-
-    # plots trigger (lado a lado)
-    left, right = st.columns(2)
-    with left:
-        plot_line(t_kin[mk], kin_trig[mk], f"Cinemática — {kin_trigger_axis} (0–20 s)")
-    with right:
-        plot_line(t_g[mg], gyro_trig[mg], f"Giroscópio — {gyro_trigger_signal} (0–20 s)")
-
-    # sliders de pico
-    st.markdown("### Selecione o tempo do pico do salto em cada sinal")
-    s1, s2 = st.columns(2)
-    with s1:
-        peak_t_kin = st.slider(
-            "Tempo do pico (cinemática)",
-            min_value=0.0, max_value=tmax,
-            value=min(1.0, tmax), step=1.0/FS_TARGET
+    # inputs numéricos (tempo do pico)
+    i1, i2 = st.columns(2)
+    with i1:
+        t_peak_kin = st.number_input(
+            "Tempo do pico — cinemática (s)",
+            min_value=0.0, max_value=tmax, value=1.0, step=0.01, format="%.2f"
         )
-    with s2:
-        peak_t_gyro = st.slider(
-            "Tempo do pico (giroscópio)",
-            min_value=0.0, max_value=tmax,
-            value=min(1.0, tmax), step=1.0/FS_TARGET
+    with i2:
+        t_peak_gyro = st.number_input(
+            "Tempo do pico — giroscópio (s)",
+            min_value=0.0, max_value=tmax, value=1.0, step=0.01, format="%.2f"
         )
 
-    idx_kin = nearest_index(t_kin, peak_t_kin)
-    idx_gyro = nearest_index(t_g, peak_t_gyro)
+    # gráficos do trigger com linha vertical
+    cL, cR = st.columns(2)
+    with cL:
+        plot_with_vline(
+            t_kin[mk], kin_trig[mk],
+            f"Cinemática — {kin_trigger_axis} (0–20 s)",
+            vline=float(t_peak_kin), vlabel="pico escolhido"
+        )
+    with cR:
+        plot_with_vline(
+            t_g[mg], gyro_trig[mg],
+            f"Giroscópio — {gyro_trigger_axis} (0–20 s)",
+            vline=float(t_peak_gyro), vlabel="pico escolhido"
+        )
 
-    # offset: alinhar pico do giroscópio no pico da cinemática
-    offset = t_g[idx_gyro] - t_kin[idx_kin]
-    t_g_aligned = t_g - offset
+    # ---- sincronização: zera o tempo em cada instrumento pelo pico escolhido
+    t_kin_sync = t_kin - float(t_peak_kin)
+    t_g_sync   = t_g   - float(t_peak_gyro)
 
-    st.info(f"Offset estimado: {offset:.4f} s  → tempo do giroscópio foi deslocado por {-offset:.4f} s para alinhar os picos.")
-
-    # gráfico sincronizado (janela em torno do pico)
-    t0 = t_kin[idx_kin]
-    t1 = t0 + float(window_post)
-
-    mks = (t_kin >= t0) & (t_kin <= t1)
-    mgs = (t_g_aligned >= t0) & (t_g_aligned <= t1)
-
-    st.markdown("### Visualização sincronizada (após o pico)")
-    fig = plt.figure()
-    plt.plot(t_kin[mks], kin_trig[mks], label=f"Cinemática ({kin_trigger_axis})")
-    plt.plot(t_g_aligned[mgs], gyro_trig[mgs], label=f"Giroscópio ({gyro_trigger_signal})", alpha=0.9)
-    plt.axvline(t0, linestyle="--", label="Pico (referência)")
-    plt.xlabel("Tempo sincronizado (s)")
-    plt.legend()
-    plt.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-    # opcional: exportar offset
-    st.markdown("### Resultado")
-    st.write(
-        {
-            "pico_cinematica_s": float(t_kin[idx_kin]),
-            "pico_giroscopio_s": float(t_g[idx_gyro]),
-            "offset_s (gyro - kin)": float(offset),
-        }
+    st.info(
+        "Aplicado: t_sync = t_original − t_pico. "
+        "Agora o pico escolhido ocorre em t=0 em ambos."
     )
 
-# -------------------------
-# 3 colunas com gráficos completos (como você pediu)
-# -------------------------
-if kin_ready and gyro_ready:
+    # -------------------------
+    # 3 colunas com gráficos completos usando o tempo sincronizado
+    # -------------------------
     st.divider()
-    st.subheader("Sinais completos (3 colunas)")
+    st.subheader("Sinais completos (tempo sincronizado)")
 
     p1, p2, p3 = st.columns(3)
 
     with p1:
         fig = plt.figure()
-        plt.plot(t_kin, y_kin)
-        plt.title("Cinemática — tempo × eixo Y (AP)")
-        plt.xlabel("Tempo (s)")
+        plt.plot(t_kin_sync, y_kin)
+        plt.axvline(0, linestyle="--", label="pico (t=0)")
+        plt.title("Cinemática — tempo_sync × eixo Y (AP)")
+        plt.xlabel("Tempo sincronizado (s)")
+        plt.legend()
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
     with p2:
         fig = plt.figure()
-        plt.plot(t_kin, z_kin)
-        plt.title("Cinemática — tempo × eixo Z (vertical)")
-        plt.xlabel("Tempo (s)")
+        plt.plot(t_kin_sync, z_kin)
+        plt.axvline(0, linestyle="--", label="pico (t=0)")
+        plt.title("Cinemática — tempo_sync × eixo Z (vertical)")
+        plt.xlabel("Tempo sincronizado (s)")
+        plt.legend()
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
     with p3:
         fig = plt.figure()
-        plt.plot(t_g, g_norm)
-        plt.title("Giroscópio — tempo × norma (||gyro||)")
-        plt.xlabel("Tempo (s)")
+        plt.plot(t_g_sync, g_norm)
+        plt.axvline(0, linestyle="--", label="pico (t=0)")
+        plt.title("Giroscópio — tempo_sync × norma (||gyro||)")
+        plt.xlabel("Tempo sincronizado (s)")
+        plt.legend()
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
+    # opcional: mostrar offsets (diferença entre picos escolhidos)
+    st.markdown("### Resultado do alinhamento")
+    st.write({
+        "t_pico_cinematica_s": float(t_peak_kin),
+        "t_pico_giroscopio_s": float(t_peak_gyro),
+        "delta_picos_s (gyro - kin)": float(t_peak_gyro - t_peak_kin)
+    })
+
 else:
-    st.caption("Carregue os dois arquivos para habilitar o trigger, a sincronização e os 3 gráficos.")
+    st.caption("Carregue os dois arquivos para habilitar o trigger e os gráficos sincronizados.")
