@@ -13,8 +13,8 @@ except Exception:
     KMeans = None
     StandardScaler = None
 
-st.set_page_config(layout="wide", page_title="Sync + Markov/KMeans por série (no ROI)")
-st.title("Sincronização por salto + Segmentação automática por série (K-means/Markov no ROI)")
+st.set_page_config(layout="wide", page_title="Sync + Markov/KMeans por série (ROI) — segmento único")
+st.title("Sincronização por salto + Segmentação automática por série (K-means/Markov no ROI) — 1 segmento por série")
 
 FS_TARGET = 100.0
 TRIGGER_VIEW_SEC = 20.0
@@ -88,7 +88,7 @@ def plot_with_lines(t, x, title, vlines=None, labels=None, xlabel="Tempo (s)"):
             lab = labels[i] if labels and i < len(labels) else None
             plt.axvline(vl, linestyle="--", label=lab)
         if labels:
-            plt.legend()
+            plt.legend(loc="upper left", fontsize=8)
     plt.title(title)
     plt.xlabel(xlabel)
     plt.tight_layout()
@@ -104,27 +104,29 @@ def mode_int(arr: np.ndarray) -> int:
     vals, cnts = np.unique(arr, return_counts=True)
     return int(vals[np.argmax(cnts)])
 
-def detect_segments_from_states(
+def baseline_from_roi_start(states: np.ndarray, fs: float, baseline_sec: float = 1.0) -> int:
+    n = int(round(baseline_sec * fs))
+    n = max(1, min(n, len(states)))
+    return mode_int(states[:n])
+
+def detect_single_segment_from_states(
     t: np.ndarray,
     states: np.ndarray,
     fs: float,
-    baseline_seconds: float = 2.0,
+    baseline_sec: float = 1.0,
     baseline_run_before: int = 10,
     other_run_after: int = 5,
-    other_run_before_end: int = 10,
-    baseline_run_after_end: int = 5,
 ):
     """
-    baseline_state = modo nos primeiros baseline_seconds DO RECORTE.
-    start: 10 baseline seguidos de 5 não-baseline
-    end:   10 não-baseline seguidos de 5 baseline (simétrico)
+    Baseline: estado predominante no 1º segundo do ROI.
+    Início: 10 amostras baseline seguidas de 5 amostras não-baseline (qualquer outro estado).
+    Fim: primeiro retorno ao baseline após o início.
+    Retorna: baseline_state, t_start, t_end (ou None se não encontrar).
     """
-    n0 = int(round(baseline_seconds * fs))
-    n0 = min(n0, len(states))
-    if n0 < max(baseline_run_before, other_run_after) + 1:
-        return None, []
+    if len(states) < (baseline_run_before + other_run_after + 2):
+        return None, None, None
 
-    baseline_state = mode_int(states[:n0])
+    baseline_state = baseline_from_roi_start(states, fs, baseline_sec=baseline_sec)
 
     def is_run(arr, idx, length, value=None, not_value=None):
         if idx < 0 or idx + length > len(arr):
@@ -136,79 +138,50 @@ def detect_segments_from_states(
             return np.all(w != not_value)
         return False
 
-    segments = []
-    i = baseline_run_before
-
-    while i < len(states) - max(other_run_after, baseline_run_after_end) - 1:
-        # START
-        found_start = False
-        while i < len(states) - other_run_after - 1:
-            if is_run(states, i - baseline_run_before, baseline_run_before, value=baseline_state) and \
-               is_run(states, i, other_run_after, not_value=baseline_state):
-                start_idx = i
-                found_start = True
-                break
-            i += 1
-        if not found_start:
+    start_idx = None
+    for i in range(baseline_run_before, len(states) - other_run_after):
+        if is_run(states, i - baseline_run_before, baseline_run_before, value=baseline_state) and \
+           is_run(states, i, other_run_after, not_value=baseline_state):
+            start_idx = i
             break
 
-        # END
-        j = start_idx + other_run_before_end
-        found_end = False
-        while j < len(states) - baseline_run_after_end - 1:
-            if is_run(states, j - other_run_before_end, other_run_before_end, not_value=baseline_state) and \
-               is_run(states, j, baseline_run_after_end, value=baseline_state):
-                end_idx = j
-                found_end = True
-                break
-            j += 1
+    if start_idx is None:
+        return baseline_state, None, None
 
-        if found_end:
-            segments.append((float(t[start_idx]), float(t[end_idx])))
-            i = end_idx + baseline_run_after_end
-        else:
-            segments.append((float(t[start_idx]), float(t[-1])))
+    end_idx = None
+    for j in range(start_idx + other_run_after, len(states)):
+        if states[j] == baseline_state:
+            end_idx = j
             break
 
-    return baseline_state, segments
+    if end_idx is None:
+        end_idx = len(states) - 1
+
+    return baseline_state, float(t[start_idx]), float(t[end_idx])
 
 def segment_markov_kmeans_1d(
     t_common: np.ndarray,
     x_common: np.ndarray,
     fs: float,
-    n_states: int = 6,
-    seed: int = 42,
-    baseline_seconds: float = 2.0,
-    baseline_run_before: int = 10,
-    other_run_after: int = 5,
-    other_run_before_end: int = 10,
-    baseline_run_after_end: int = 5,
+    n_states: int,
+    seed: int,
 ):
     """
-    Aplica KMeans+Markov em UMA série temporal.
-    Features: [x(t), dx/dt]  (melhora a separação em 1D)
+    Aplica KMeans em UMA série (no ROI). Features: [x(t), dx/dt].
+    Retorna states (labels KMeans) no eixo t_common.
     """
     if KMeans is None or StandardScaler is None:
         raise RuntimeError("sklearn não disponível.")
 
     x = np.asarray(x_common, dtype=float)
-    dx = np.gradient(x) * fs  # derivada aproximada
+    dx = np.gradient(x) * fs
 
     Xfeat = np.column_stack([x, dx])
     Xs = StandardScaler().fit_transform(Xfeat)
 
     km = KMeans(n_clusters=n_states, random_state=int(seed), n_init=20)
     states = km.fit_predict(Xs).astype(int)
-
-    baseline_state, segments = detect_segments_from_states(
-        t_common, states, fs,
-        baseline_seconds=baseline_seconds,
-        baseline_run_before=baseline_run_before,
-        other_run_after=other_run_after,
-        other_run_before_end=other_run_before_end,
-        baseline_run_after_end=baseline_run_after_end,
-    )
-    return states, baseline_state, segments
+    return states
 
 # -------------------------
 # Uploads
@@ -298,7 +271,7 @@ if gyro_file is not None:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Trigger manual + sincronização + ROI + Markov/KMeans por série no ROI
+# Trigger manual + sincronização + ROI + Markov/KMeans por série no ROI (segmento único)
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
@@ -373,7 +346,7 @@ if kin_ready and gyro_ready:
     if roi_start > roi_end:
         roi_start, roi_end = roi_end, roi_start
 
-    # ROI plots
+    # ROI overlay
     p1, p2, p3 = st.columns(3)
     with p1:
         plot_with_lines(t_kin_sync, y_kin, "Cinemática Y com ROI",
@@ -388,136 +361,100 @@ if kin_ready and gyro_ready:
                         vlines=[0.0, roi_start, roi_end], labels=["pico", "ROI início", "ROI fim"],
                         xlabel="Tempo sincronizado (s)")
 
-    # Sinais no ROI (para mostrar)
-    tY_roi, y_roi, _ = segment_by_time(t_kin_sync, y_kin, roi_start, roi_end)
-    tZ_roi, z_roi, _ = segment_by_time(t_kin_sync, z_kin, roi_start, roi_end)
-    tG_roi, g_roi, _ = segment_by_time(t_g_sync, g_norm, roi_start, roi_end)
-
+    # Markov/KMeans por série só no ROI
     st.divider()
-    st.subheader("ROI recortado (visualização)")
-
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        plot_with_lines(tY_roi, y_roi, "ROI — Cinemática Y (AP)", xlabel="Tempo sincronizado (s)")
-    with q2:
-        plot_with_lines(tZ_roi, z_roi, "ROI — Cinemática Z (vertical)", xlabel="Tempo sincronizado (s)")
-    with q3:
-        plot_with_lines(tG_roi, g_roi, "ROI — Giroscópio norma (||gyro||)", xlabel="Tempo sincronizado (s)")
-
-    # --------- Markov/KMeans POR SÉRIE (somente no ROI) ---------
-    st.divider()
-    st.subheader("Segmentação automática por série (K-means 6 estados + regra Markov) — dentro do ROI")
+    st.subheader("Segmentação automática por série (K-means 6 estados + regra Markov) — 1 segmento por série")
 
     if KMeans is None or StandardScaler is None:
         st.error("Para esta etapa é necessário scikit-learn (sklearn).")
         st.stop()
 
-    if (roi_end - roi_start) < 3.0:
-        st.warning("ROI muito curto. Recomendo >= 3s (baseline 2s + detecção).")
+    if (roi_end - roi_start) < 2.0:
+        st.warning("ROI muito curto. Recomendo >= 2s para baseline=1s + detecção.")
         st.stop()
 
     t_common = np.arange(roi_start, roi_end, 1.0 / FS_TARGET)
-    if len(t_common) < int(3.0 * FS_TARGET):
+    if len(t_common) < 50:
         st.warning("Poucas amostras no ROI para segmentação estável.")
         st.stop()
 
-    # interpola cada série no mesmo t_common (somente para ter base temporal igual dentro do ROI)
     y_common = np.interp(t_common, t_kin_sync, y_kin)
     z_common = np.interp(t_common, t_kin_sync, z_kin)
     g_common = np.interp(t_common, t_g_sync, g_norm)
 
-    # parâmetros fixos (como você definiu)
-    baseline_seconds = 2.0
-    baseline_run_before = 10
-    other_run_after = 5
-    # fim simétrico (ajustável depois)
-    other_run_before_end = 10
-    baseline_run_after_end = 5
-
     seed = st.number_input("Seed do K-means (usado em todas as séries)", min_value=0, value=42, step=1)
 
-    # roda por série
-    states_y, base_y, segs_y = segment_markov_kmeans_1d(
-        t_common, y_common, FS_TARGET, n_states=6, seed=int(seed),
-        baseline_seconds=baseline_seconds,
-        baseline_run_before=baseline_run_before,
-        other_run_after=other_run_after,
-        other_run_before_end=other_run_before_end,
-        baseline_run_after_end=baseline_run_after_end
+    # KMeans states por série (independente)
+    states_y = segment_markov_kmeans_1d(t_common, y_common, FS_TARGET, n_states=6, seed=int(seed))
+    states_z = segment_markov_kmeans_1d(t_common, z_common, FS_TARGET, n_states=6, seed=int(seed))
+    states_g = segment_markov_kmeans_1d(t_common, g_common, FS_TARGET, n_states=6, seed=int(seed))
+
+    # baseline = 1s após início do ROI; regra: 10 baseline -> 5 não-baseline; 1 segmento por série
+    base_y, y_start, y_end = detect_single_segment_from_states(
+        t_common, states_y, FS_TARGET, baseline_sec=1.0, baseline_run_before=10, other_run_after=5
+    )
+    base_z, z_start, z_end = detect_single_segment_from_states(
+        t_common, states_z, FS_TARGET, baseline_sec=1.0, baseline_run_before=10, other_run_after=5
+    )
+    base_g, g_start, g_end = detect_single_segment_from_states(
+        t_common, states_g, FS_TARGET, baseline_sec=1.0, baseline_run_before=10, other_run_after=5
     )
 
-    states_z, base_z, segs_z = segment_markov_kmeans_1d(
-        t_common, z_common, FS_TARGET, n_states=6, seed=int(seed),
-        baseline_seconds=baseline_seconds,
-        baseline_run_before=baseline_run_before,
-        other_run_after=other_run_after,
-        other_run_before_end=other_run_before_end,
-        baseline_run_after_end=baseline_run_after_end
-    )
-
-    states_g, base_g, segs_g = segment_markov_kmeans_1d(
-        t_common, g_common, FS_TARGET, n_states=6, seed=int(seed),
-        baseline_seconds=baseline_seconds,
-        baseline_run_before=baseline_run_before,
-        other_run_after=other_run_after,
-        other_run_before_end=other_run_before_end,
-        baseline_run_after_end=baseline_run_after_end
-    )
-
-    st.markdown("### Baseline state por série (modo nos 2s iniciais do ROI)")
+    st.markdown("### Resultado por série")
     st.write({
-        "baseline_Y": None if base_y is None else int(base_y),
-        "baseline_Z": None if base_z is None else int(base_z),
-        "baseline_norma_gyro": None if base_g is None else int(base_g),
-        "n_subsegs_Y": int(len(segs_y)),
-        "n_subsegs_Z": int(len(segs_z)),
-        "n_subsegs_norma_gyro": int(len(segs_g)),
+        "baseline_state_Y (1s após ROI início)": None if base_y is None else int(base_y),
+        "inicio_Y_s": y_start, "fim_Y_s": y_end,
+        "baseline_state_Z (1s após ROI início)": None if base_z is None else int(base_z),
+        "inicio_Z_s": z_start, "fim_Z_s": z_end,
+        "baseline_state_G_norm (1s após ROI início)": None if base_g is None else int(base_g),
+        "inicio_G_s": g_start, "fim_G_s": g_end,
     })
 
-    # overlays: cada gráfico recebe os subsegmentos da sua própria série
-    def vlines_from_segments(roi_start, roi_end, segments, label_prefix):
+    # Overlays: cada série mostra ROI + seu próprio início/fim detectado (se existir)
+    def make_lines(roi_start, roi_end, t_start, t_end, prefix):
         v = [roi_start, roi_end]
         lab = ["ROI início", "ROI fim"]
-        for i, (ts, te) in enumerate(segments, start=1):
-            v += [ts, te]
-            lab += [f"{label_prefix} início {i}", f"{label_prefix} fim {i}"]
+        if (t_start is not None) and (t_end is not None):
+            v += [t_start, t_end]
+            lab += [f"{prefix} início", f"{prefix} fim"]
         return v, lab
 
-    vy, ly = vlines_from_segments(roi_start, roi_end, segs_y, "Y")
-    vz, lz = vlines_from_segments(roi_start, roi_end, segs_z, "Z")
-    vg, lg = vlines_from_segments(roi_start, roi_end, segs_g, "G")
+    vy, ly = make_lines(roi_start, roi_end, y_start, y_end, "Y")
+    vz, lz = make_lines(roi_start, roi_end, z_start, z_end, "Z")
+    vg, lg = make_lines(roi_start, roi_end, g_start, g_end, "G")
 
     st.divider()
-    st.subheader("Sinais com subsegmentos (cada série com sua própria detecção)")
+    st.subheader("Sinais com segmento detectado (1 por série)")
 
     r1, r2, r3 = st.columns(3)
     with r1:
-        plot_with_lines(t_kin_sync, y_kin, "Cinemática Y (AP) — subsegmentos detectados em Y",
+        plot_with_lines(t_kin_sync, y_kin, "Cinemática Y (AP) — 1 segmento detectado em Y",
                         vlines=vy, labels=ly, xlabel="Tempo sincronizado (s)")
     with r2:
-        plot_with_lines(t_kin_sync, z_kin, "Cinemática Z — subsegmentos detectados em Z",
+        plot_with_lines(t_kin_sync, z_kin, "Cinemática Z — 1 segmento detectado em Z",
                         vlines=vz, labels=lz, xlabel="Tempo sincronizado (s)")
     with r3:
-        plot_with_lines(t_g_sync, g_norm, "Giroscópio norma — subsegmentos detectados na norma",
+        plot_with_lines(t_g_sync, g_norm, "Giroscópio norma — 1 segmento detectado na norma",
                         vlines=vg, labels=lg, xlabel="Tempo sincronizado (s)")
 
-    # Tabelas
+    # Segmentos recortados detectados (se existirem)
     st.divider()
-    st.subheader("Tabelas de subsegmentos por série")
+    st.subheader("Registros segmentados (detectados automaticamente)")
 
-    def seg_df(name, segs):
-        return pd.DataFrame(
-            [{"serie": name, "subsegmento": i+1, "inicio_s": s, "fim_s": e, "duracao_s": e-s}
-             for i, (s, e) in enumerate(segs)]
-        )
+    def plot_detected_segment(name, t_start, t_end, t_full, x_full):
+        if t_start is None or t_end is None:
+            st.caption(f"{name}: nenhum segmento detectado com os critérios atuais.")
+            return
+        t_seg, x_seg, _ = segment_by_time(t_full, x_full, t_start, t_end)
+        plot_with_lines(t_seg, x_seg, f"{name} — segmento detectado", xlabel="Tempo sincronizado (s)")
 
-    tabs = st.tabs(["Cinemática Y", "Cinemática Z", "Norma giroscópio"])
-    with tabs[0]:
-        st.dataframe(seg_df("Y", segs_y), use_container_width=True)
-    with tabs[1]:
-        st.dataframe(seg_df("Z", segs_z), use_container_width=True)
-    with tabs[2]:
-        st.dataframe(seg_df("G_norm", segs_g), use_container_width=True)
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        plot_detected_segment("Cinemática Y", y_start, y_end, t_kin_sync, y_kin)
+    with a2:
+        plot_detected_segment("Cinemática Z", z_start, z_end, t_kin_sync, z_kin)
+    with a3:
+        plot_detected_segment("Giroscópio norma", g_start, g_end, t_g_sync, g_norm)
 
 else:
     st.caption("Carregue os dois arquivos para habilitar trigger, sincronização, ROI e segmentação por série.")
