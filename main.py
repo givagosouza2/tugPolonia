@@ -101,8 +101,8 @@ def plot_with_lines(
             lab = labels_red[i] if labels_red and i < len(labels_red) else None
             plt.axvline(vl, linestyle="--", color="red", label=lab)
 
-    if (labels_black and len(labels_black) > 0) or (labels_red and len(labels_red) > 0):
-        plt.legend(loc="upper left", fontsize=8)
+    #if (labels_black and len(labels_black) > 0) or (labels_red and len(labels_red) > 0):
+    #    plt.legend(loc="upper left", fontsize=8)
 
     plt.title(title)
     plt.xlabel(xlabel)
