@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from scipy import signal
 
 st.set_page_config(layout="wide", page_title="Sync Cinemática x Giroscópio")
-st.title("Sincronização por salto (Cinemática x Giroscópio)")
+st.title("Sincronização por salto (Cinemática x Giroscópio) + Segmentação")
 
 FS_TARGET = 100.0
 TRIGGER_VIEW_SEC = 20.0
@@ -16,8 +16,7 @@ CUTOFF_HZ = 1.5
 # Helpers
 # -------------------------
 def read_table(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file, sep=None, engine="python")
-    return df
+    return pd.read_csv(uploaded_file, sep=None, engine="python")
 
 def safe_numeric(series) -> np.ndarray:
     x = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
@@ -26,11 +25,6 @@ def safe_numeric(series) -> np.ndarray:
     return x
 
 def fix_nans_1d(x: np.ndarray) -> tuple[np.ndarray, int]:
-    """
-    Resolve NaN/vazios:
-    - interpola NaNs internos (linear)
-    - preenche bordas (bfill/ffill)
-    """
     s = pd.Series(x.astype(float))
     n_nan = int(s.isna().sum())
     if n_nan > 0:
@@ -56,13 +50,11 @@ def interpolate_to_fs(t_in: np.ndarray, x_in: np.ndarray, fs_out: float):
     t_in = t_in[order]
     x_in = x_in[order]
 
-    # remove tempos repetidos
     dt = np.diff(t_in)
     keep = np.hstack(([True], dt > 0))
     t_in = t_in[keep]
     x_in = x_in[keep]
 
-    # remove NaNs
     m = np.isfinite(t_in) & np.isfinite(x_in)
     t_in = t_in[m]
     x_in = x_in[m]
@@ -80,16 +72,25 @@ def butter_lowpass_filtfilt(x: np.ndarray, fs: float, cutoff_hz: float, order: i
     b, a = signal.butter(order, wn, btype="lowpass")
     return signal.filtfilt(b, a, x)
 
-def plot_with_vline(t, x, title, vline=None, vlabel="pico"):
+def plot_with_lines(t, x, title, vlines=None, labels=None, xlabel="Tempo (s)"):
     fig = plt.figure()
     plt.plot(t, x)
-    if vline is not None:
-        plt.axvline(vline, linestyle="--", label=vlabel)
-        plt.legend()
+    if vlines is not None:
+        for i, vl in enumerate(vlines):
+            lab = labels[i] if labels and i < len(labels) else None
+            plt.axvline(vl, linestyle="--", label=lab)
+        if labels:
+            plt.legend()
     plt.title(title)
-    plt.xlabel("Tempo (s)")
+    plt.xlabel(xlabel)
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
+
+def segment_by_time(t: np.ndarray, x: np.ndarray, t0: float, t1: float):
+    if t0 > t1:
+        t0, t1 = t1, t0
+    m = (t >= t0) & (t <= t1)
+    return t[m], x[m], m
 
 # -------------------------
 # Uploads
@@ -97,21 +98,16 @@ def plot_with_vline(t, x, title, vline=None, vlabel="pico"):
 colA, colB = st.columns(2)
 with colA:
     st.subheader("1) Cinemática")
-    kin_file = st.file_uploader(
-        "Carregue o arquivo de cinemática (.csv/.txt)", type=["csv", "txt"], key="kin"
-    )
-
+    kin_file = st.file_uploader("Carregue o arquivo de cinemática (.csv/.txt)", type=["csv", "txt"], key="kin")
 with colB:
     st.subheader("2) Giroscópio")
-    gyro_file = st.file_uploader(
-        "Carregue o arquivo do giroscópio (.csv/.txt)", type=["csv", "txt"], key="gyro"
-    )
+    gyro_file = st.file_uploader("Carregue o arquivo do giroscópio (.csv/.txt)", type=["csv", "txt"], key="gyro")
 
 kin_ready = False
 gyro_ready = False
 
 # -------------------------
-# Processa Cinemática (fixo por posição: 1=X ignora, 2=Y plota, 3=Z trigger+plota)
+# Cinemática (fixo por posição: 1=X ignora, 2=Y plota, 3=Z trigger+plota)
 # -------------------------
 if kin_file is not None:
     try:
@@ -121,9 +117,9 @@ if kin_file is not None:
         if df_kin.shape[1] < 3:
             raise ValueError("O arquivo de cinemática deve ter pelo menos 3 colunas: X, Y, Z.")
 
-        col_x = df_kin.columns[0]  # ignora
-        col_y = df_kin.columns[1]  # Y (AP)
-        col_z = df_kin.columns[2]  # Z (vertical)
+        col_x = df_kin.columns[0]
+        col_y = df_kin.columns[1]
+        col_z = df_kin.columns[2]
 
         y_kin_raw = safe_numeric(df_kin[col_y])
         z_kin_raw = safe_numeric(df_kin[col_z])
@@ -135,7 +131,6 @@ if kin_file is not None:
             st.warning(f"Cinemática: corrigidos NaNs/vazios → Y: {n_nan_y}, Z: {n_nan_z}")
 
         t_kin = time_vector(len(df_kin), FS_TARGET)
-
         st.caption(f"Mapeamento cinemática (fixo): X='{col_x}' (ignorado), Y='{col_y}', Z='{col_z}'")
 
         kin_ready = True
@@ -143,7 +138,7 @@ if kin_file is not None:
         st.error(f"Erro ao processar cinemática: {e}")
 
 # -------------------------
-# Processa Giroscópio (tempo = 1ª coluna) + detrend + interp 100 Hz + LP 1.5 Hz + norma
+# Giroscópio (tempo = 1ª coluna) + detrend + interp 100 Hz + LP 1.5 Hz + norma
 # -------------------------
 if gyro_file is not None:
     try:
@@ -154,11 +149,10 @@ if gyro_file is not None:
         if len(cols_g) < 4:
             raise ValueError("O arquivo do giroscópio deve ter pelo menos 4 colunas: tempo + 3 eixos.")
 
-        time_col = cols_g[0]  # FIXO
+        time_col = cols_g[0]
         t_g_in = safe_numeric(df_g[time_col])
         t_g_in = guess_time_unit_and_convert_to_seconds(t_g_in)
 
-        # seleção dos eixos (colunas 2..)
         g1, g2, g3 = st.columns(3)
         with g1:
             gx_col = st.selectbox("Coluna gyro X", cols_g[1:], index=0)
@@ -171,22 +165,18 @@ if gyro_file is not None:
         gy = safe_numeric(df_g[gy_col])
         gz = safe_numeric(df_g[gz_col])
 
-        # detrend
         gx_dt = signal.detrend(gx, type="linear")
         gy_dt = signal.detrend(gy, type="linear")
         gz_dt = signal.detrend(gz, type="linear")
 
-        # interp p/ 100 Hz
         t_g, gx_i = interpolate_to_fs(t_g_in, gx_dt, FS_TARGET)
         _,   gy_i = interpolate_to_fs(t_g_in, gy_dt, FS_TARGET)
         _,   gz_i = interpolate_to_fs(t_g_in, gz_dt, FS_TARGET)
 
-        # LP 1.5 Hz
         gx_f = butter_lowpass_filtfilt(gx_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
         gy_f = butter_lowpass_filtfilt(gy_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
         gz_f = butter_lowpass_filtfilt(gz_i, FS_TARGET, cutoff_hz=CUTOFF_HZ, order=4)
 
-        # norma
         g_norm = np.sqrt(gx_f**2 + gy_f**2 + gz_f**2)
 
         gyro_ready = True
@@ -194,7 +184,7 @@ if gyro_file is not None:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Trigger (0–20 s): plota Z da cinemática e Y do giroscópio + inputs numéricos + zeragem do tempo
+# Trigger (0–20 s) + zeragem do tempo
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
@@ -204,7 +194,6 @@ if kin_ready and gyro_ready:
     mk = (t_kin >= 0) & (t_kin <= tmax)
     mg = (t_g >= 0) & (t_g <= tmax)
 
-    # inputs numéricos
     i1, i2 = st.columns(2)
     with i1:
         t_peak_kin = st.number_input(
@@ -217,19 +206,18 @@ if kin_ready and gyro_ready:
             min_value=0.0, max_value=tmax, value=1.0, step=0.01, format="%.2f"
         )
 
-    # plots 0–20s com linha vertical
     cL, cR = st.columns(2)
     with cL:
-        plot_with_vline(
+        plot_with_lines(
             t_kin[mk], z_kin[mk],
             "Cinemática — eixo Z (0–20 s)",
-            vline=float(t_peak_kin), vlabel="pico escolhido"
+            vlines=[float(t_peak_kin)], labels=["pico"]
         )
     with cR:
-        plot_with_vline(
+        plot_with_lines(
             t_g[mg], gy_f[mg],
             "Giroscópio — eixo Y (filtrado) (0–20 s)",
-            vline=float(t_peak_gyro), vlabel="pico escolhido"
+            vlines=[float(t_peak_gyro)], labels=["pico"]
         )
 
     # zeragem do tempo (pico -> t=0)
@@ -239,49 +227,110 @@ if kin_ready and gyro_ready:
     st.info("Aplicado: t_sync = t_original − t_pico. Agora o pico escolhido ocorre em t=0 em ambos.")
 
     # -------------------------
-    # 3 colunas: cinemática tempo_sync×Y, cinemática tempo_sync×Z, giroscópio tempo_sync×norma
+    # 3 gráficos completos (tempo sincronizado) com marcações de segmento
     # -------------------------
     st.divider()
-    st.subheader("Sinais completos (tempo sincronizado)")
+    st.subheader("Sinais completos (tempo sincronizado) + seleção do segmento")
 
+    # limites possíveis do segmento (interseção do tempo sincronizado)
+    tmin_common = float(max(np.min(t_kin_sync), np.min(t_g_sync)))
+    tmax_common = float(min(np.max(t_kin_sync), np.max(t_g_sync)))
+
+    if tmax_common <= tmin_common:
+        st.error("Não foi possível encontrar faixa temporal comum entre cinemática e giroscópio após a sincronização.")
+        st.stop()
+
+    s1, s2 = st.columns(2)
+    with s1:
+        seg_start = st.number_input(
+            "Início do segmento (s) [tempo sincronizado]",
+            min_value=tmin_common, max_value=tmax_common, value=max(0.0, tmin_common), step=0.05, format="%.2f"
+        )
+    with s2:
+        seg_end = st.number_input(
+            "Fim do segmento (s) [tempo sincronizado]",
+            min_value=tmin_common, max_value=tmax_common, value=min(5.0, tmax_common), step=0.05, format="%.2f"
+        )
+
+    # garante ordem
+    if seg_start > seg_end:
+        seg_start, seg_end = seg_end, seg_start
+
+    # plots completos com linhas do segmento + linha do pico (t=0)
     p1, p2, p3 = st.columns(3)
 
     with p1:
-        fig = plt.figure()
-        plt.plot(t_kin_sync, y_kin)
-        plt.axvline(0, linestyle="--", label="pico (t=0)")
-        plt.title("Cinemática — tempo_sync × eixo Y (AP)")
-        plt.xlabel("Tempo sincronizado (s)")
-        plt.legend()
-        plt.tight_layout()
-        st.pyplot(fig, clear_figure=True)
+        plot_with_lines(
+            t_kin_sync, y_kin,
+            "Cinemática — tempo_sync × eixo Y (AP)",
+            vlines=[0.0, seg_start, seg_end],
+            labels=["pico (t=0)", "início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
 
     with p2:
-        fig = plt.figure()
-        plt.plot(t_kin_sync, z_kin)
-        plt.axvline(0, linestyle="--", label="pico (t=0)")
-        plt.title("Cinemática — tempo_sync × eixo Z (vertical)")
-        plt.xlabel("Tempo sincronizado (s)")
-        plt.legend()
-        plt.tight_layout()
-        st.pyplot(fig, clear_figure=True)
+        plot_with_lines(
+            t_kin_sync, z_kin,
+            "Cinemática — tempo_sync × eixo Z (vertical)",
+            vlines=[0.0, seg_start, seg_end],
+            labels=["pico (t=0)", "início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
 
     with p3:
-        fig = plt.figure()
-        plt.plot(t_g_sync, g_norm)
-        plt.axvline(0, linestyle="--", label="pico (t=0)")
-        plt.title("Giroscópio — tempo_sync × norma (||gyro||)")
-        plt.xlabel("Tempo sincronizado (s)")
-        plt.legend()
-        plt.tight_layout()
-        st.pyplot(fig, clear_figure=True)
+        plot_with_lines(
+            t_g_sync, g_norm,
+            "Giroscópio — tempo_sync × norma (||gyro||)",
+            vlines=[0.0, seg_start, seg_end],
+            labels=["pico (t=0)", "início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
 
-    st.markdown("### Resultado do alinhamento")
+    # -------------------------
+    # Segmentos (abaixo): recorta e plota novamente
+    # -------------------------
+    st.divider()
+    st.subheader("Registros segmentados")
+
+    tY_seg, y_seg, _ = segment_by_time(t_kin_sync, y_kin, seg_start, seg_end)
+    tZ_seg, z_seg, _ = segment_by_time(t_kin_sync, z_kin, seg_start, seg_end)
+    tG_seg, g_seg, _ = segment_by_time(t_g_sync,   g_norm, seg_start, seg_end)
+
+    q1, q2, q3 = st.columns(3)
+
+    with q1:
+        plot_with_lines(
+            tY_seg, y_seg,
+            "Segmento — Cinemática Y (AP)",
+            vlines=[seg_start, seg_end], labels=["início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
+
+    with q2:
+        plot_with_lines(
+            tZ_seg, z_seg,
+            "Segmento — Cinemática Z (vertical)",
+            vlines=[seg_start, seg_end], labels=["início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
+
+    with q3:
+        plot_with_lines(
+            tG_seg, g_seg,
+            "Segmento — Giroscópio norma (||gyro||)",
+            vlines=[seg_start, seg_end], labels=["início", "fim"],
+            xlabel="Tempo sincronizado (s)"
+        )
+
+    # Resumo
+    st.markdown("### Resumo do segmento")
     st.write({
-        "t_pico_cinematica_s": float(t_peak_kin),
-        "t_pico_giroscopio_s": float(t_peak_gyro),
-        "delta_picos_s (gyro - kin)": float(t_peak_gyro - t_peak_kin),
+        "inicio_s": float(seg_start),
+        "fim_s": float(seg_end),
+        "duracao_s": float(seg_end - seg_start),
+        "amostras_cinematica": int(len(tY_seg)),
+        "amostras_giroscopio": int(len(tG_seg)),
     })
 
 else:
-    st.caption("Carregue os dois arquivos para habilitar o trigger e os gráficos sincronizados.")
+    st.caption("Carregue os dois arquivos para habilitar trigger, sincronização e segmentação.")
