@@ -5,16 +5,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
 
-# KMeans + scaler
+# sklearn (KMeans)
 try:
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
-except Exception as e:
+except Exception:
     KMeans = None
     StandardScaler = None
 
-st.set_page_config(layout="wide", page_title="Sync + Segmentação Markov/KMeans")
-st.title("Sincronização por salto (Cinemática x Giroscópio) + Segmentação automática (K-means/Markov)")
+st.set_page_config(layout="wide", page_title="Sync + Segmentação Markov/KMeans (no recorte)")
+st.title("Sincronização por salto + Segmentação automática (Markov/K-means) aplicada APENAS no intervalo de interesse")
 
 FS_TARGET = 100.0
 TRIGGER_VIEW_SEC = 20.0
@@ -115,12 +115,9 @@ def detect_segments_from_states(
     baseline_run_after_end: int = 5,
 ):
     """
-    Retorna:
-      baseline_state, segments=[(t_start, t_end), ...]
-    Regras:
-      baseline_state = modo nos primeiros baseline_seconds
-      start: 10 baseline seguidos de 5 não-baseline
-      end:   10 não-baseline seguidos de 5 baseline  (simétrico)
+    baseline_state = modo nos primeiros baseline_seconds DO RECORTE.
+    start: 10 baseline seguidos de 5 não-baseline
+    end:   10 não-baseline seguidos de 5 baseline (simétrico)
     """
     n0 = int(round(baseline_seconds * fs))
     n0 = min(n0, len(states))
@@ -129,23 +126,21 @@ def detect_segments_from_states(
 
     baseline_state = mode_int(states[:n0])
 
-    segments = []
-    i = baseline_run_before
-
-    # helper para checar runs
     def is_run(arr, idx, length, value=None, not_value=None):
         if idx < 0 or idx + length > len(arr):
             return False
-        window = arr[idx: idx + length]
+        w = arr[idx: idx + length]
         if value is not None:
-            return np.all(window == value)
+            return np.all(w == value)
         if not_value is not None:
-            return np.all(window != not_value)
+            return np.all(w != not_value)
         return False
 
-    # detecta múltiplos segmentos: baseline -> nonbaseline -> baseline -> ...
+    segments = []
+    i = baseline_run_before
+
     while i < len(states) - max(other_run_after, baseline_run_after_end) - 1:
-        # procura START
+        # START
         found_start = False
         while i < len(states) - other_run_after - 1:
             if is_run(states, i - baseline_run_before, baseline_run_before, value=baseline_state) and \
@@ -154,26 +149,24 @@ def detect_segments_from_states(
                 found_start = True
                 break
             i += 1
-
         if not found_start:
             break
 
-        # a partir do start, procura END (retorno ao baseline)
+        # END
         j = start_idx + other_run_before_end
         found_end = False
         while j < len(states) - baseline_run_after_end - 1:
             if is_run(states, j - other_run_before_end, other_run_before_end, not_value=baseline_state) and \
                is_run(states, j, baseline_run_after_end, value=baseline_state):
-                end_idx = j  # primeiro baseline após o bloco de não-baseline
+                end_idx = j
                 found_end = True
                 break
             j += 1
 
         if found_end:
             segments.append((float(t[start_idx]), float(t[end_idx])))
-            i = end_idx + baseline_run_after_end  # pula pra frente
+            i = end_idx + baseline_run_after_end
         else:
-            # segmento aberto até o fim
             segments.append((float(t[start_idx]), float(t[-1])))
             break
 
@@ -194,14 +187,14 @@ kin_ready = False
 gyro_ready = False
 
 # -------------------------
-# Cinemática (fixo por posição: 1=X ignora, 2=Y plota, 3=Z trigger+plota)
+# Cinemática (fixa por posição: X ignora, Y plota, Z trigger+plota)
 # -------------------------
 if kin_file is not None:
     try:
         df_kin = read_table(kin_file)
-        st.success(f"Cinemática: {df_kin.shape[0]} linhas × {df_kin.shape[1]} colunas")
         if df_kin.shape[1] < 3:
             raise ValueError("O arquivo de cinemática deve ter pelo menos 3 colunas: X, Y, Z.")
+        st.success(f"Cinemática: {df_kin.shape[0]} linhas × {df_kin.shape[1]} colunas")
 
         col_x = df_kin.columns[0]  # ignora
         col_y = df_kin.columns[1]  # Y (AP)
@@ -217,7 +210,8 @@ if kin_file is not None:
             st.warning(f"Cinemática: corrigidos NaNs/vazios → Y: {n_nan_y}, Z: {n_nan_z}")
 
         t_kin = time_vector(len(df_kin), FS_TARGET)
-        st.caption(f"Mapeamento cinemática (fixo): X='{col_x}' (ignorado), Y='{col_y}', Z='{col_z}'")
+        st.caption(f"Mapeamento cinemática: X='{col_x}' (ignorado), Y='{col_y}', Z='{col_z}'")
+
         kin_ready = True
     except Exception as e:
         st.error(f"Erro ao processar cinemática: {e}")
@@ -228,11 +222,10 @@ if kin_file is not None:
 if gyro_file is not None:
     try:
         df_g = read_table(gyro_file)
-        st.success(f"Giroscópio: {df_g.shape[0]} linhas × {df_g.shape[1]} colunas")
-
         cols_g = list(df_g.columns)
         if len(cols_g) < 4:
             raise ValueError("O arquivo do giroscópio deve ter pelo menos 4 colunas: tempo + 3 eixos.")
+        st.success(f"Giroscópio: {df_g.shape[0]} linhas × {df_g.shape[1]} colunas")
 
         time_col = cols_g[0]
         t_g_in = safe_numeric(df_g[time_col])
@@ -268,11 +261,11 @@ if gyro_file is not None:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Trigger manual (0–20 s) + zeragem do tempo
+# Trigger manual + sincronização + recorte manual + (Markov/KMeans dentro do recorte)
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
-    st.subheader("Ajuste do trigger (0–20 s) — escolha do pico e zeragem do tempo")
+    st.subheader("Trigger (0–20 s) — escolha do pico e zeragem do tempo")
 
     tmax = float(TRIGGER_VIEW_SEC)
     mk = (t_kin >= 0) & (t_kin <= tmax)
@@ -292,167 +285,194 @@ if kin_ready and gyro_ready:
 
     cL, cR = st.columns(2)
     with cL:
-        plot_with_lines(
-            t_kin[mk], z_kin[mk],
-            "Cinemática — eixo Z (0–20 s)",
-            vlines=[float(t_peak_kin)], labels=["pico"]
-        )
+        plot_with_lines(t_kin[mk], z_kin[mk], "Cinemática — Z (0–20 s)",
+                        vlines=[float(t_peak_kin)], labels=["pico"])
     with cR:
-        plot_with_lines(
-            t_g[mg], gy_f[mg],
-            "Giroscópio — eixo Y (filtrado) (0–20 s)",
-            vlines=[float(t_peak_gyro)], labels=["pico"]
-        )
+        plot_with_lines(t_g[mg], gy_f[mg], "Giroscópio — Y filtrado (0–20 s)",
+                        vlines=[float(t_peak_gyro)], labels=["pico"])
 
-    # zeragem do tempo
+    # zerar tempo pelo pico
     t_kin_sync = t_kin - float(t_peak_kin)
     t_g_sync   = t_g   - float(t_peak_gyro)
 
-    st.info("Aplicado: t_sync = t_original − t_pico. Agora o pico escolhido ocorre em t=0 em ambos.")
+    st.info("Tempo sincronizado: t_sync = t − t_pico. Pico ocorre em t=0 em ambos.")
 
-    # -------------------------
-    # Segmentação automática por KMeans/Markov
-    # -------------------------
+    # --------- 3 gráficos completos sincronizados ---------
     st.divider()
-    st.subheader("Segmentação automática (K-means 6 estados + regra Markov)")
+    st.subheader("Sinais completos (tempo sincronizado)")
+
+    vlines_base = [0.0]
+    labels_base = ["pico (t=0)"]
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        plot_with_lines(t_kin_sync, y_kin, "Cinemática — tempo_sync × Y (AP)",
+                        vlines=vlines_base, labels=labels_base, xlabel="Tempo sincronizado (s)")
+    with p2:
+        plot_with_lines(t_kin_sync, z_kin, "Cinemática — tempo_sync × Z (vertical)",
+                        vlines=vlines_base, labels=labels_base, xlabel="Tempo sincronizado (s)")
+    with p3:
+        plot_with_lines(t_g_sync, g_norm, "Giroscópio — tempo_sync × norma (||gyro||)",
+                        vlines=vlines_base, labels=labels_base, xlabel="Tempo sincronizado (s)")
+
+    # --------- RECORTE MANUAL: intervalo de interesse ---------
+    st.divider()
+    st.subheader("Intervalo de interesse (manual) — este recorte define onde a Markov/K-means será aplicada")
+
+    tmin_common = float(max(np.min(t_kin_sync), np.min(t_g_sync)))
+    tmax_common = float(min(np.max(t_kin_sync), np.max(t_g_sync)))
+    if tmax_common <= tmin_common:
+        st.error("Não foi possível encontrar faixa temporal comum após sincronização.")
+        st.stop()
+
+    s1, s2 = st.columns(2)
+    with s1:
+        seg_start = st.number_input(
+            "Início do intervalo de interesse (s)",
+            min_value=tmin_common, max_value=tmax_common,
+            value=max(0.0, tmin_common), step=0.05, format="%.2f"
+        )
+    with s2:
+        seg_end = st.number_input(
+            "Fim do intervalo de interesse (s)",
+            min_value=tmin_common, max_value=tmax_common,
+            value=min(10.0, tmax_common), step=0.05, format="%.2f"
+        )
+    if seg_start > seg_end:
+        seg_start, seg_end = seg_end, seg_start
+
+    # overlay do recorte nos sinais completos
+    vlines_roi = [0.0, seg_start, seg_end]
+    labels_roi = ["pico (t=0)", "ROI início", "ROI fim"]
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        plot_with_lines(t_kin_sync, y_kin, "Cinemática — Y (AP) com ROI",
+                        vlines=vlines_roi, labels=labels_roi, xlabel="Tempo sincronizado (s)")
+    with p2:
+        plot_with_lines(t_kin_sync, z_kin, "Cinemática — Z com ROI",
+                        vlines=vlines_roi, labels=labels_roi, xlabel="Tempo sincronizado (s)")
+    with p3:
+        plot_with_lines(t_g_sync, g_norm, "Giroscópio — norma com ROI",
+                        vlines=vlines_roi, labels=labels_roi, xlabel="Tempo sincronizado (s)")
+
+    # sinais recortados (ROI)
+    tY_roi, y_roi, _ = segment_by_time(t_kin_sync, y_kin, seg_start, seg_end)
+    tZ_roi, z_roi, _ = segment_by_time(t_kin_sync, z_kin, seg_start, seg_end)
+    tG_roi, g_roi, _ = segment_by_time(t_g_sync, g_norm, seg_start, seg_end)
+
+    st.divider()
+    st.subheader("ROI (intervalo de interesse) — sinais recortados")
+
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        plot_with_lines(tY_roi, y_roi, "ROI — Cinemática Y (AP)",
+                        vlines=[seg_start, seg_end], labels=["ROI início", "ROI fim"], xlabel="Tempo sincronizado (s)")
+    with q2:
+        plot_with_lines(tZ_roi, z_roi, "ROI — Cinemática Z (vertical)",
+                        vlines=[seg_start, seg_end], labels=["ROI início", "ROI fim"], xlabel="Tempo sincronizado (s)")
+    with q3:
+        plot_with_lines(tG_roi, g_roi, "ROI — Giroscópio norma (||gyro||)",
+                        vlines=[seg_start, seg_end], labels=["ROI início", "ROI fim"], xlabel="Tempo sincronizado (s)")
+
+    # --------- AGORA SIM: Markov/KMeans só dentro do ROI ---------
+    st.divider()
+    st.subheader("Markov/K-means (6 estados) aplicado SOMENTE dentro do ROI")
 
     if KMeans is None or StandardScaler is None:
-        st.error("Falta scikit-learn no ambiente (sklearn). Instale para usar KMeans/StandardScaler.")
+        st.error("Para esta etapa é necessário scikit-learn (sklearn).")
         st.stop()
 
-    # parâmetros (fixos conforme seu critério)
-    k_states = 6
-    baseline_seconds = 2.0
-    baseline_run_before = 10
-    other_run_after = 5
-
-    # Para fim do segmento (simétrico)
-    other_run_before_end = 10
-    baseline_run_after_end = 5
-
-    # Construir eixo temporal comum (interseção)
-    t0_common = max(np.min(t_kin_sync), np.min(t_g_sync))
-    t1_common = min(np.max(t_kin_sync), np.max(t_g_sync))
-    if t1_common <= t0_common:
-        st.error("Não há faixa temporal comum entre cinemática e giroscópio após sincronização.")
+    # eixo comum dentro do ROI (para juntar sinais)
+    if seg_end - seg_start < 3.0:
+        st.warning("ROI muito curto. Recomendo pelo menos ~3s para baseline(2s) + detecção.")
         st.stop()
 
-    t_common = np.arange(t0_common, t1_common, 1.0 / FS_TARGET)
+    t_common = np.arange(seg_start, seg_end, 1.0 / FS_TARGET)
+    if len(t_common) < int(3.0 * FS_TARGET):
+        st.warning("Poucas amostras dentro do ROI para uma segmentação estável.")
+        st.stop()
 
-    # Interpolar sinais no eixo comum
     y_common = np.interp(t_common, t_kin_sync, y_kin)
     z_common = np.interp(t_common, t_kin_sync, z_kin)
     g_common = np.interp(t_common, t_g_sync, g_norm)
 
-    # Features para KMeans (você pode trocar aqui se quiser: só gyro, só z, etc.)
+    # features do KMeans no ROI
     Xfeat = np.column_stack([y_common, z_common, g_common])
+    Xs = StandardScaler().fit_transform(Xfeat)
 
-    # padronização
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(Xfeat)
-
-    # KMeans
     seed = st.number_input("Seed do K-means", min_value=0, value=42, step=1)
-    km = KMeans(n_clusters=k_states, random_state=int(seed), n_init=20)
+    km = KMeans(n_clusters=6, random_state=int(seed), n_init=20)
     states = km.fit_predict(Xs).astype(int)
 
-    baseline_state, segments = detect_segments_from_states(
+    # critério (exatamente como você definiu para o INÍCIO)
+    baseline_seconds = 2.0
+    baseline_run_before = 10
+    other_run_after = 5
+
+    # para o FIM (simétrico; se quiser outro critério, eu ajusto)
+    other_run_before_end = 10
+    baseline_run_after_end = 5
+
+    baseline_state, subsegments = detect_segments_from_states(
         t_common, states, FS_TARGET,
         baseline_seconds=baseline_seconds,
         baseline_run_before=baseline_run_before,
         other_run_after=other_run_after,
         other_run_before_end=other_run_before_end,
-        baseline_run_after_end=baseline_run_after_end
+        baseline_run_after_end=baseline_run_after_end,
     )
 
-    if baseline_state is None:
-        st.warning("Não foi possível determinar baseline/segmentos (registro muito curto ou dados insuficientes).")
-        segments = []
-
     st.write({
-        "baseline_state (modo nos 2s iniciais)": None if baseline_state is None else int(baseline_state),
-        "n_segmentos_detectados": int(len(segments))
+        "baseline_state (modo nos 2s iniciais do ROI)": None if baseline_state is None else int(baseline_state),
+        "subsegmentos_detectados_no_ROI": int(len(subsegments))
     })
 
-    # Overlay dos segmentos nos 3 gráficos (tempo sincronizado)
+    # overlay dos subsegmentos no ROI
+    v_sub = [seg_start, seg_end]
+    l_sub = ["ROI início", "ROI fim"]
+    for i, (ts, te) in enumerate(subsegments, start=1):
+        v_sub += [ts, te]
+        l_sub += [f"início {i}", f"fim {i}"]
+
+    st.markdown("#### ROI com subsegmentos detectados")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        plot_with_lines(t_kin_sync, y_kin, "Cinemática — Y (com ROI + subsegmentos)",
+                        vlines=v_sub, labels=l_sub, xlabel="Tempo sincronizado (s)")
+    with r2:
+        plot_with_lines(t_kin_sync, z_kin, "Cinemática — Z (com ROI + subsegmentos)",
+                        vlines=v_sub, labels=l_sub, xlabel="Tempo sincronizado (s)")
+    with r3:
+        plot_with_lines(t_g_sync, g_norm, "Giroscópio — norma (com ROI + subsegmentos)",
+                        vlines=v_sub, labels=l_sub, xlabel="Tempo sincronizado (s)")
+
     st.divider()
-    st.subheader("Sinais completos (tempo sincronizado) com segmentos detectados")
+    st.subheader("Subsegmentos (dentro do ROI) — visualização")
 
-    # linhas verticais: pico=0 + inícios/fins
-    vlines = [0.0]
-    labels = ["pico (t=0)"]
-    for i, (ts, te) in enumerate(segments, start=1):
-        vlines += [ts, te]
-        labels += [f"início {i}", f"fim {i}"]
-
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        plot_with_lines(
-            t_kin_sync, y_kin,
-            "Cinemática — tempo_sync × eixo Y (AP)",
-            vlines=vlines, labels=labels,
-            xlabel="Tempo sincronizado (s)"
-        )
-    with p2:
-        plot_with_lines(
-            t_kin_sync, z_kin,
-            "Cinemática — tempo_sync × eixo Z (vertical)",
-            vlines=vlines, labels=labels,
-            xlabel="Tempo sincronizado (s)"
-        )
-    with p3:
-        plot_with_lines(
-            t_g_sync, g_norm,
-            "Giroscópio — tempo_sync × norma (||gyro||)",
-            vlines=vlines, labels=labels,
-            xlabel="Tempo sincronizado (s)"
-        )
-
-    # Mostrar segmentos recortados abaixo
-    st.divider()
-    st.subheader("Registros segmentados (automático)")
-
-    if len(segments) == 0:
-        st.caption("Nenhum segmento foi detectado com os critérios atuais.")
+    if len(subsegments) == 0:
+        st.caption("Nenhum subsegmento detectado dentro do ROI com os critérios atuais.")
     else:
-        # tabela
         seg_df = pd.DataFrame(
-            [{"segmento": i+1, "inicio_s": s, "fim_s": e, "duracao_s": e - s} for i, (s, e) in enumerate(segments)]
+            [{"subsegmento": i+1, "inicio_s": s, "fim_s": e, "duracao_s": e - s} for i, (s, e) in enumerate(subsegments)]
         )
         st.dataframe(seg_df, use_container_width=True)
 
-        # plot cada segmento (opção: escolher qual)
-        seg_ids = [f"Segmento {i+1}" for i in range(len(segments))]
-        choice = st.selectbox("Selecione um segmento para visualizar", seg_ids, index=0)
-        idx = seg_ids.index(choice)
-        seg_start, seg_end = segments[idx]
+        choice = st.selectbox("Escolha um subsegmento para plotar", [f"Subsegmento {i+1}" for i in range(len(subsegments))], index=0)
+        idx = int(choice.split()[-1]) - 1
+        sub_start, sub_end = subsegments[idx]
 
-        tY_seg, y_seg, _ = segment_by_time(t_common, y_common, seg_start, seg_end)
-        tZ_seg, z_seg, _ = segment_by_time(t_common, z_common, seg_start, seg_end)
-        tG_seg, g_seg, _ = segment_by_time(t_common, g_common, seg_start, seg_end)
+        tY_sub, y_sub, _ = segment_by_time(t_common, y_common, sub_start, sub_end)
+        tZ_sub, z_sub, _ = segment_by_time(t_common, z_common, sub_start, sub_end)
+        tG_sub, g_sub, _ = segment_by_time(t_common, g_common, sub_start, sub_end)
 
-        q1, q2, q3 = st.columns(3)
-        with q1:
-            plot_with_lines(
-                tY_seg, y_seg,
-                f"{choice} — Cinemática Y (AP)",
-                vlines=[seg_start, seg_end], labels=["início", "fim"],
-                xlabel="Tempo sincronizado (s)"
-            )
-        with q2:
-            plot_with_lines(
-                tZ_seg, z_seg,
-                f"{choice} — Cinemática Z (vertical)",
-                vlines=[seg_start, seg_end], labels=["início", "fim"],
-                xlabel="Tempo sincronizado (s)"
-            )
-        with q3:
-            plot_with_lines(
-                tG_seg, g_seg,
-                f"{choice} — Giroscópio norma (||gyro||)",
-                vlines=[seg_start, seg_end], labels=["início", "fim"],
-                xlabel="Tempo sincronizado (s)"
-            )
+        u1, u2, u3 = st.columns(3)
+        with u1:
+            plot_with_lines(tY_sub, y_sub, f"{choice} — Y (AP)", xlabel="Tempo sincronizado (s)")
+        with u2:
+            plot_with_lines(tZ_sub, z_sub, f"{choice} — Z (vertical)", xlabel="Tempo sincronizado (s)")
+        with u3:
+            plot_with_lines(tG_sub, g_sub, f"{choice} — norma (||gyro||)", xlabel="Tempo sincronizado (s)")
 
 else:
-    st.caption("Carregue os dois arquivos para habilitar trigger, sincronização e segmentação.")
+    st.caption("Carregue os dois arquivos para habilitar trigger, sincronização, ROI e Markov/K-means.")
