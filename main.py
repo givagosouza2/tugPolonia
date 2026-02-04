@@ -521,7 +521,7 @@ if kin_ready and gyro_ready:
             plt.scatter([t_min], [y_min], s=40, label="mínimo")
         plt.title("Cinemática Y (AP)")
         plt.xlabel("Tempo sincronizado (s)")
-        plt.legend(loc="upper left", fontsize=8)
+        #plt.legend(loc="upper left", fontsize=8)
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
@@ -542,7 +542,7 @@ if kin_ready and gyro_ready:
 
         plt.title("Cinemática Z (vertical)")
         plt.xlabel("Tempo sincronizado (s)")
-        plt.legend(loc="upper left", fontsize=8)
+        #plt.legend(loc="upper left", fontsize=8)
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
