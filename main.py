@@ -13,8 +13,8 @@ except Exception:
     KMeans = None
     StandardScaler = None
 
-st.set_page_config(layout="wide", page_title="Sync + Markov/KMeans por série — picos em Z e giroscópio")
-st.title("Sync por salto + Segmentação (K-means/Markov por série no ROI) — mínimos em Y, picos em Z e picos no giroscópio")
+st.set_page_config(layout="wide", page_title="Sync + Markov/KMeans por série — tabelas de parâmetros")
+st.title("Sync por salto + Segmentação (K-means/Markov por série no ROI) — parâmetros cinemática e giroscópio")
 
 FS_TARGET = 100.0
 TRIGGER_VIEW_SEC = 20.0
@@ -89,13 +89,11 @@ def plot_with_lines(
     fig = plt.figure()
     plt.plot(t, x)
 
-    # linhas pretas (ROI etc.)
     if vlines_black is not None:
         for i, vl in enumerate(vlines_black):
             lab = labels_black[i] if labels_black and i < len(labels_black) else None
             plt.axvline(vl, linestyle="--", label=lab)
 
-    # linhas vermelhas (Markov)
     if vlines_red is not None:
         for i, vl in enumerate(vlines_red):
             lab = labels_red[i] if labels_red and i < len(labels_red) else None
@@ -110,6 +108,8 @@ def plot_with_lines(
     st.pyplot(fig, clear_figure=True)
 
 def segment_by_time(t: np.ndarray, x: np.ndarray, t0: float, t1: float):
+    if t0 is None or t1 is None:
+        return np.array([]), np.array([]), np.array([], dtype=bool)
     if t0 > t1:
         t0, t1 = t1, t0
     m = (t >= t0) & (t <= t1)
@@ -181,28 +181,28 @@ def kmeans_states_1d(x_common: np.ndarray, fs: float, n_states: int, seed: int):
     return km.fit_predict(Xs).astype(int)
 
 def top2_peaks_in_window(t: np.ndarray, x: np.ndarray, t0: float, t1: float, fs: float):
-    """
-    Encontra os 2 maiores picos (máximos locais) em x no intervalo [t0, t1].
-    Retorna lista [(t_peak, x_peak), ...] ordenada por amplitude desc.
-    """
+    if t0 is None or t1 is None:
+        return []
     if t0 > t1:
         t0, t1 = t1, t0
     tt, xx, _ = segment_by_time(t, x, t0, t1)
     if len(xx) < 10:
         return []
-    dist = int(round(0.2 * fs))  # evita picos muito próximos
+    dist = int(round(0.2 * fs))
     peaks, _ = signal.find_peaks(xx, distance=max(1, dist))
     if len(peaks) == 0:
         return []
     amps = xx[peaks]
     order = np.argsort(amps)[::-1]
     sel = order[:2]
-    return [(float(tt[int(peaks[i])]), float(xx[int(peaks[i])])) for i in sel]
+    out = [(float(tt[int(peaks[i])]), float(xx[int(peaks[i])])) for i in sel]
+    # ordena por tempo também, útil para "menor tempo" e "maior tempo"
+    out_time = sorted(out, key=lambda z: z[0])
+    return out, out_time  # (top2 por amp), (mesmos 2 ordenados por tempo)
 
 def first_peak_after_time_within(t: np.ndarray, x: np.ndarray, t0: float, t1: float, fs: float):
-    """
-    Primeiro pico (máximo local) após t0, mas RESTRITO ao intervalo [t0, t1].
-    """
+    if t0 is None or t1 is None:
+        return None, None
     if t0 > t1:
         t0, t1 = t1, t0
     tt, xx, _ = segment_by_time(t, x, t0, t1)
@@ -214,6 +214,27 @@ def first_peak_after_time_within(t: np.ndarray, x: np.ndarray, t0: float, t1: fl
         return None, None
     p = int(peaks[0])
     return float(tt[p]), float(xx[p])
+
+def peaks_first_last_in_window(t: np.ndarray, x: np.ndarray, t0: float, t1: float, fs: float):
+    if t0 is None or t1 is None:
+        return (None, None), (None, None)
+    if t0 > t1:
+        t0, t1 = t1, t0
+    tt, xx, _ = segment_by_time(t, x, t0, t1)
+    if len(xx) < 10:
+        return (None, None), (None, None)
+    dist = int(round(0.2 * fs))
+    peaks, _ = signal.find_peaks(xx, distance=max(1, dist))
+    if len(peaks) == 0:
+        return (None, None), (None, None)
+    p_first = int(peaks[0])
+    p_last = int(peaks[-1])
+    return (float(tt[p_first]), float(xx[p_first])), (float(tt[p_last]), float(xx[p_last]))
+
+def safe_diff(a, b):
+    if a is None or b is None:
+        return None
+    return float(a) - float(b)
 
 # -------------------------
 # Uploads
@@ -303,7 +324,7 @@ if gyro_file is not None:
         st.error(f"Erro ao processar giroscópio: {e}")
 
 # -------------------------
-# Trigger + ROI + Markov
+# Trigger + ROI + Markov + Métricas + Plots
 # -------------------------
 if kin_ready and gyro_ready:
     st.divider()
@@ -411,122 +432,115 @@ if kin_ready and gyro_ready:
                                                     end_baseline_sec=1.0, baseline_run=10, other_run=5)
 
     # -------------------------
-    # TABELA: Markov início/fim por série
+    # Derivados CINEMÁTICA
     # -------------------------
-    results_df = pd.DataFrame([
-        {"Série": "Cinemática Y (AP)", "Início (s)": y_start, "Fim (s)": y_end,
-         "Duração (s)": (y_end - y_start) if (y_start is not None and y_end is not None) else None},
-        {"Série": "Cinemática Z (vertical)", "Início (s)": z_start, "Fim (s)": z_end,
-         "Duração (s)": (z_end - z_start) if (z_start is not None and z_end is not None) else None},
-        {"Série": "Norma do giroscópio", "Início (s)": g_start, "Fim (s)": g_end,
-         "Duração (s)": (g_end - g_start) if (g_start is not None and g_end is not None) else None},
-    ])
-    st.markdown("### Início e fim detectados (Markov) — por série")
-    st.dataframe(results_df, use_container_width=True)
-
-    # -------------------------
-    # MÍNIMO da cinemática Y entre início/fim Markov
-    # -------------------------
-    st.divider()
-    st.subheader("Cinemática Y (AP): mínimo entre início e fim (Markov)")
-
-    y_min = None
-    t_min = None
-
-    if y_start is None or y_end is None:
-        st.warning("Não foi possível calcular o mínimo: início/fim Markov da Cinemática Y não foram detectados.")
-    else:
+    # mínimo Y entre y_start e y_end (no sinal completo sincronizado)
+    y_min_t = None
+    if y_start is not None and y_end is not None:
         t0, t1 = (y_start, y_end) if y_start <= y_end else (y_end, y_start)
-        t_seg, y_seg, _ = segment_by_time(t_kin_sync, y_kin, t0, t1)
-        if len(y_seg) >= 3:
-            idx_min = int(np.nanargmin(y_seg))
-            y_min = float(y_seg[idx_min])
-            t_min = float(t_seg[idx_min])
-            st.write({"t_min_Y_s": t_min, "min_Y": y_min})
-        else:
-            st.warning("Segmento muito curto para estimar mínimo com confiabilidade.")
+        ty, yy, _ = segment_by_time(t_kin_sync, y_kin, t0, t1)
+        if len(yy) >= 3:
+            idx_min = int(np.nanargmin(yy))
+            y_min_t = float(ty[idx_min])
 
-    # -------------------------
-    # PICOS em Z: 1º pico após z_start e 1º pico antes de z_end
-    # -------------------------
-    st.divider()
-    st.subheader("Cinemática Z: 1º pico após início e 1º pico antes do fim (Markov)")
-
-    z_peak1_t = z_peak1_val = None
-    z_peak2_t = z_peak2_val = None
-
-    if z_start is None or z_end is None:
-        st.warning("Não foi possível buscar picos: início/fim Markov da Cinemática Z não foram detectados.")
-    else:
+    # picos Z: 1º após z_start e 1º antes z_end (no sinal completo sincronizado)
+    (z_peak1_t, z_peak1_val), (z_peak2_t, z_peak2_val) = (None, None), (None, None)
+    if z_start is not None and z_end is not None:
         t0z, t1z = (z_start, z_end) if z_start <= z_end else (z_end, z_start)
-        t_zseg, z_zseg, _ = segment_by_time(t_kin_sync, z_kin, t0z, t1z)
-        if len(z_zseg) < 10:
-            st.warning("Segmento de Z muito curto para detecção de picos.")
-        else:
-            dist = int(round(0.2 * FS_TARGET))
-            peaks, _ = signal.find_peaks(z_zseg, distance=max(1, dist))
-            if len(peaks) == 0:
-                st.warning("Nenhum pico encontrado em Z dentro do intervalo Markov.")
-            else:
-                p_first = int(peaks[0])
-                z_peak1_t = float(t_zseg[p_first])
-                z_peak1_val = float(z_zseg[p_first])
-
-                p_last = int(peaks[-1])
-                z_peak2_t = float(t_zseg[p_last])
-                z_peak2_val = float(z_zseg[p_last])
-
-                st.write({
-                    "Z_pico_pos_inicio_t_s": z_peak1_t,
-                    "Z_pico_pos_inicio_val": z_peak1_val,
-                    "Z_pico_pre_fim_t_s": z_peak2_t,
-                    "Z_pico_pre_fim_val": z_peak2_val,
-                })
+        (z_peak1_t, z_peak1_val), (z_peak2_t, z_peak2_val) = peaks_first_last_in_window(
+            t_kin_sync, z_kin, t0z, t1z, FS_TARGET
+        )
 
     # -------------------------
-    # GIROSCÓPIO: 2 MAIORES PICOS entre g_start e g_end + 1º pico após g_start
+    # Derivados GIROSCÓPIO
     # -------------------------
-    st.divider()
-    st.subheader("Giroscópio (norma): picos entre início e fim (Markov)")
-
-    gyro_top2 = []
+    gyro_top2_by_amp = []
+    gyro_top2_by_time = []
     g_first_peak_t = g_first_peak_val = None
 
-    if g_start is None or g_end is None:
-        st.warning("Não foi possível buscar picos: início/fim Markov do giroscópio não foram detectados.")
-    else:
-        gyro_top2 = top2_peaks_in_window(t_g_sync, g_norm, g_start, g_end, fs=FS_TARGET)
-        g_first_peak_t, g_first_peak_val = first_peak_after_time_within(t_g_sync, g_norm, g_start, g_end, fs=FS_TARGET)
+    if g_start is not None and g_end is not None:
+        (gyro_top2_by_amp, gyro_top2_by_time) = top2_peaks_in_window(
+            t_g_sync, g_norm, g_start, g_end, fs=FS_TARGET
+        )
+        g_first_peak_t, g_first_peak_val = first_peak_after_time_within(
+            t_g_sync, g_norm, g_start, g_end, fs=FS_TARGET
+        )
 
-        # tabela/valores
-        out_rows = []
-        for k, (tp, vp) in enumerate(gyro_top2, start=1):
-            out_rows.append({"tipo": "Top pico", "rank": k, "t_pico_s": tp, "amplitude": vp})
-        if g_first_peak_t is not None:
-            out_rows.append({"tipo": "1º pico após início", "rank": 1, "t_pico_s": g_first_peak_t, "amplitude": g_first_peak_val})
-
-        if len(out_rows) > 0:
-            st.dataframe(pd.DataFrame(out_rows), use_container_width=True)
-        else:
-            st.warning("Nenhum pico encontrado no intervalo Markov do giroscópio.")
+    # “menor tempo” e “maior tempo” (entre os 2 maiores picos por amplitude)
+    # Se só houver 1 pico, ambos viram o mesmo.
+    gyro_early_t = gyro_early_val = None
+    gyro_late_t = gyro_late_val = None
+    if len(gyro_top2_by_time) >= 1:
+        gyro_early_t, gyro_early_val = gyro_top2_by_time[0]
+        gyro_late_t, gyro_late_val = gyro_top2_by_time[-1]
 
     # -------------------------
-    # PLOTS com estrutura original (3 colunas)
+    # TABELAS (como você pediu)
     # -------------------------
+    st.divider()
+    st.subheader("Tabelas de parâmetros")
+
+    # ---- Tabela cinemática
+    kin_params = {
+        "Início do sinal AP (Y)": y_start,
+        "Final do sinal AP (Y)": y_end,
+        "Início do sinal V (Z)": z_start,
+        "Final do sinal V (Z)": z_end,
+        "Alcance em 3 m AP (min Y)": y_min_t,
+        "Pico sentado→pé em Z (1º pico após início)": z_peak1_t,
+        "Pico pé→sentado em Z (pico antes do final)": z_peak2_t,
+        "Duração total AP": safe_diff(y_end, y_start),
+        "Duração total V": safe_diff(z_end, z_start),
+        "Duração da ida": safe_diff(y_min_t, z_peak1_t),
+        "Duração da volta": safe_diff(z_peak2_t, y_min_t),
+        "Duração para ficar em pé": safe_diff(z_peak1_t, z_start),
+        "Duração para sentar": safe_diff(z_end, z_peak2_t),
+    }
+    kin_table = pd.DataFrame(
+        [{"Parâmetro": k, "Valor (s)": v} for k, v in kin_params.items()]
+    )
+    st.markdown("### Cinemática")
+    st.dataframe(kin_table, use_container_width=True)
+
+    # ---- Tabela giroscópio
+    gyro_params = {
+        "Início giro": g_start,
+        "Final giro": g_end,
+        "Ficar em sentado/pé (1º pico após início)": g_first_peak_t,
+        "Alcance em 3 m (grande giro de menor tempo)": gyro_early_t,
+        "Giro na cadeira (grande giro de maior tempo)": gyro_late_t,
+        "Duração total giro": safe_diff(g_end, g_start),
+        "Duração de sentado/pé giro": safe_diff(g_first_peak_t, g_start),
+        "Duração da ida giro": safe_diff(gyro_early_t, g_first_peak_t),
+        "Duração da volta giro": safe_diff(gyro_late_t, gyro_early_t),
+        "Duração de pé/sentado giro": safe_diff(gyro_late_t, g_end),  # conforme seu texto
+    }
+    gyro_table = pd.DataFrame(
+        [{"Parâmetro": k, "Valor (s)": v} for k, v in gyro_params.items()]
+    )
+    st.markdown("### Giroscópio")
+    st.dataframe(gyro_table, use_container_width=True)
+
+    # -------------------------
+    # PLOTS (estrutura 3 colunas)
+    # -------------------------
+    st.divider()
+    st.subheader("Gráficos (com ROI, Markov e marcadores)")
+
     r1, r2, r3 = st.columns(3)
 
     with r1:
-        v_red = [v for v in [y_start, y_end] if v is not None]
-        l_red = [lab for lab, v in zip(["Y início (Markov)", "Y fim (Markov)"], [y_start, y_end]) if v is not None]
         fig = plt.figure()
         plt.plot(t_kin_sync, y_kin)
         plt.axvline(roi_start, linestyle="--", label="ROI início")
         plt.axvline(roi_end, linestyle="--", label="ROI fim")
-        for i, vl in enumerate(v_red):
-            plt.axvline(vl, linestyle="--", color="red", label=l_red[i])
-        if t_min is not None and y_min is not None:
-            plt.axvline(t_min, linestyle="-", label="t do mínimo")
-            plt.scatter([t_min], [y_min], s=40, label="mínimo")
+        for vl, lab in [(y_start, "Y início (Markov)"), (y_end, "Y fim (Markov)")]:
+            if vl is not None:
+                plt.axvline(vl, linestyle="--", color="red", label=lab)
+        if y_min_t is not None:
+            y_min_val = float(np.interp(y_min_t, t_kin_sync, y_kin))
+            plt.axvline(y_min_t, linestyle="-", label="t do mínimo")
+            plt.scatter([y_min_t], [y_min_val], s=40, label="mínimo Y")
         plt.title("Cinemática Y (AP)")
         plt.xlabel("Tempo sincronizado (s)")
         plt.legend(loc="upper left", fontsize=8)
@@ -541,12 +555,10 @@ if kin_ready and gyro_ready:
         for vl, lab in [(z_start, "Z início (Markov)"), (z_end, "Z fim (Markov)")]:
             if vl is not None:
                 plt.axvline(vl, linestyle="--", color="red", label=lab)
-
         if z_peak1_t is not None:
             plt.scatter([z_peak1_t], [z_peak1_val], s=45, label="1º pico após início")
         if z_peak2_t is not None:
-            plt.scatter([z_peak2_t], [z_peak2_val], s=45, label="1º pico antes do fim")
-
+            plt.scatter([z_peak2_t], [z_peak2_val], s=45, label="pico antes do fim")
         plt.title("Cinemática Z (vertical)")
         plt.xlabel("Tempo sincronizado (s)")
         plt.legend(loc="upper left", fontsize=8)
@@ -562,11 +574,11 @@ if kin_ready and gyro_ready:
             if vl is not None:
                 plt.axvline(vl, linestyle="--", color="red", label=lab)
 
-        # marca top2
-        for k, (tp, vp) in enumerate(gyro_top2, start=1):
+        # marca 2 maiores picos (por amplitude)
+        for k, (tp, vp) in enumerate(gyro_top2_by_amp, start=1):
             plt.scatter([tp], [vp], s=55, label=f"Top {k} pico")
 
-        # marca 1º pico após início Markov
+        # marca 1º pico após início
         if g_first_peak_t is not None:
             plt.scatter([g_first_peak_t], [g_first_peak_val], s=65, label="1º pico após início")
 
@@ -576,6 +588,9 @@ if kin_ready and gyro_ready:
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
+    # -------------------------
+    # Segmentos recortados
+    # -------------------------
     st.divider()
     st.subheader("Segmentos recortados (usando início/fim Markov)")
 
